@@ -40,6 +40,7 @@ pub(crate) fn serve(config: Config) {
         cors_enabled,
         metrics_token,
         axum_enabled: _,
+        public_url,
     } = config;
 
     let files = Staticfile::new(&root).expect("Unable to open root directory");
@@ -73,7 +74,10 @@ pub(crate) fn serve(config: Config) {
 
     mount.mount("/metrics", metrics);
 
-    let mut chain = Chain::new(mount);
+    let mut root = Mount::new();
+    root.mount(&public_url, mount);
+
+    let mut chain = Chain::new(root);
     let file_logger = FileLogger::new(logfile).expect("Unable to create file logger");
     let logger = StatisticLogger::new(file_logger);
     let rewrite = Rewrite::new(vec![vec!["help".into()]], "/index.html".into());

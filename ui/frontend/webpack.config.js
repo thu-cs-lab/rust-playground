@@ -66,7 +66,7 @@ module.exports = function(_, argv) {
     },
 
     output: {
-      publicPath: 'assets/',
+      publicPath: process.env.PUBLIC_URL + '/assets/',
       path: `${__dirname}/build/assets`,
       filename: `${filenameTemplate}.js`,
       chunkFilename: `${chunkFilenameTemplate}.js`,
@@ -138,6 +138,7 @@ module.exports = function(_, argv) {
     },
 
     plugins: [
+      new webpack.EnvironmentPlugin(['PUBLIC_URL']),
       new webpack.DefinePlugin({
         ACE_KEYBINDINGS: JSON.stringify(allKeybindings),
         ACE_THEMES: JSON.stringify(allThemes),

@@ -193,7 +193,7 @@ const receiveExecuteFailure = ({ error, isAutoBuild }) =>
   createAction(ActionType.ExecuteFailed, { error, isAutoBuild });
 
 function jsonGet(urlObj) {
-  const urlStr = url.format(urlObj);
+  const urlStr = process.env.PUBLIC_URL + url.format(urlObj);
 
   return fetchJson(urlStr, {
     method: 'get',
@@ -201,7 +201,7 @@ function jsonGet(urlObj) {
 }
 
 function jsonPost(urlObj, body) {
-  const urlStr = url.format(urlObj);
+  const urlStr = process.env.PUBLIC_URL + url.format(urlObj);
 
   return fetchJson(urlStr, {
     method: 'post',

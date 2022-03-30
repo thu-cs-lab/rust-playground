@@ -52,6 +52,7 @@ struct Config {
     metrics_token: Option<String>,
     port: u16,
     root: PathBuf,
+    public_url: String,
 }
 
 impl Config {
@@ -70,6 +71,7 @@ impl Config {
         let gh_token =
             env::var("PLAYGROUND_GITHUB_TOKEN").expect("Must specify PLAYGROUND_GITHUB_TOKEN");
         let metrics_token = env::var("PLAYGROUND_METRICS_TOKEN").ok();
+        let public_url = env::var("PLAYGROUND_PUBLIC_URL").unwrap_or_else(|_| "".to_string());
 
         let logfile =
             env::var("PLAYGROUND_LOG_FILE").unwrap_or_else(|_| DEFAULT_LOG_FILE.to_string());
@@ -86,6 +88,7 @@ impl Config {
             metrics_token,
             port,
             root,
+            public_url,
         }
     }
 
