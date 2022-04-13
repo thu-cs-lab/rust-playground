@@ -80,10 +80,10 @@ pub(crate) fn serve(config: Config) {
     let mut chain = Chain::new(root);
     let file_logger = FileLogger::new(logfile).expect("Unable to create file logger");
     let logger = StatisticLogger::new(file_logger);
-    let rewrite = Rewrite::new(vec![
-        vec!["rust".into(), "help".into()],
-        vec!["rust".into(), "help".into(), "".into()],
-        ], "/rust/index.html".into());
+    let rewrite = Rewrite::new(
+        vec![vec!["rust".into(), "help".into()]],
+        "/rust/index.html".into(),
+    );
     let gh_token = GhToken::new(gh_token);
 
     chain.link_around(logger);
