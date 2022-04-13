@@ -13,7 +13,6 @@ How to deploy:
 PLAYGROUND_UI_ROOT=./frontend/build
 # unused, write anything here
 PLAYGROUND_GITHUB_TOKEN=unused
-PLAYGROUND_SERVER_AXUM=1
 PLAYGROUND_UI_ADDRESS=0.0.0.0
 PLAYGROUND_PUBLIC_URL=/rust
 ```
