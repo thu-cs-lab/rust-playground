@@ -32,7 +32,7 @@ import { State } from './reducers';
 import Router from './Router';
 import sessionStorage from './session_storage';
 
-const baseUrl = url.resolve(window.location.href, '/');
+const baseUrl = url.resolve(window.location.href, process.env.PUBLIC_URL);
 
 const initialGlobalState = {
   globalConfiguration: {

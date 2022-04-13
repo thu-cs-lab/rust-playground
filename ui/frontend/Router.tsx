@@ -25,7 +25,7 @@ const stateToLocation = ({ page, configuration }) => {
   switch (page) {
     case 'help': {
       return {
-        pathname: '/help',
+        pathname: `${process.env.PUBLIC_URL}/help`,
       };
     }
 
@@ -36,7 +36,7 @@ const stateToLocation = ({ page, configuration }) => {
         edition: configuration.edition,
       };
       return {
-        pathname: `/?${qs.stringify(query)}`,
+        pathname: `${process.env.PUBLIC_URL}/?${qs.stringify(query)}`,
       };
     }
   }

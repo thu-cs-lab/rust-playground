@@ -253,8 +253,13 @@ fn meta_version_miri(_req: &mut Request<'_, '_>) -> IronResult<Response> {
 fn meta_gist_create(req: &mut Request<'_, '_>) -> IronResult<Response> {
     let token = req.extensions.get::<GhToken>().unwrap().0.as_ref().clone();
     serialize_to_response(deserialize_from_request(req, |r: MetaGistCreateRequest| {
-        let gist = gist::create(token, r.code);
-        Ok(MetaGistResponse::from(gist))
+        //let gist = gist::create(token, r.code);
+        // do not create gist
+        Ok(MetaGistResponse {
+            id: String::new(),
+            url: String::new(),
+            code: r.code,
+        })
     }))
 }
 

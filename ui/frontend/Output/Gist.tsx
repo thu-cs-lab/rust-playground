@@ -60,8 +60,13 @@ const Links: React.SFC = () => {
 
   return (
     <Fragment>
+      {
+      // disable github gist
+      /*
       <Copied href={permalink}>Permalink to the playground</Copied>
       <Copied href={gistUrl}>Direct link to the gist</Copied>
+      */
+      }
       <Copied href={codeUrl}>Embedded code in link</Copied>
       <NewWindow href={urloUrl}>Open a new thread in the Rust user forum</NewWindow>
     </Fragment>
