@@ -9,8 +9,8 @@ import Route from 'route-parser';
 
 import * as actions from './actions';
 
-const homeRoute = new Route('/');
-const helpRoute = new Route('/help');
+const homeRoute = new Route(process.env.PUBLIC_URL + '/');
+const helpRoute = new Route(process.env.PUBLIC_URL +'/help');
 
 const stateSelector = ({ page, configuration: { channel, mode, edition } }) => ({
   page,
