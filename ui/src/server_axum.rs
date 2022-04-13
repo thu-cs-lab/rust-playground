@@ -48,29 +48,33 @@ const MAX_AGE_ONE_YEAR: HeaderValue = HeaderValue::from_static("public, max-age=
 pub(crate) async fn serve(config: Config) {
     let root_files = static_file_service(config.root_path(), MAX_AGE_ONE_DAY);
     let asset_files = static_file_service(config.asset_path(), MAX_AGE_ONE_YEAR);
-    let rewrite_help_as_index = middleware::from_fn(rewrite_help_as_index);
+    // let rewrite_help_as_index = middleware::from_fn(rewrite_help_as_index);
 
     let mut app = Router::new()
-        .fallback(root_files)
-        .nest("/assets", asset_files)
-        .layer(rewrite_help_as_index)
-        .route("/evaluate.json", post(evaluate))
-        .route("/compile", post(compile))
-        .route("/execute", post(execute))
-        .route("/format", post(format))
-        .route("/clippy", post(clippy))
-        .route("/miri", post(miri))
-        .route("/macro-expansion", post(macro_expansion))
-        .route("/meta/crates", get_or_post(meta_crates))
-        .route("/meta/version/stable", get_or_post(meta_version_stable))
-        .route("/meta/version/beta", get_or_post(meta_version_beta))
-        .route("/meta/version/nightly", get_or_post(meta_version_nightly))
-        .route("/meta/version/rustfmt", get_or_post(meta_version_rustfmt))
-        .route("/meta/version/clippy", get_or_post(meta_version_clippy))
-        .route("/meta/version/miri", get_or_post(meta_version_miri))
-        .route("/meta/gist", post(meta_gist_create))
-        .route("/meta/gist/:id", get(meta_gist_get))
-        .route("/metrics", get(metrics))
+        .nest(
+            &config.public_url,
+            Router::new()
+                .route("/", root_files.clone())
+                .route("/help", root_files)
+                .nest("/assets", asset_files)
+                .route("/evaluate.json", post(evaluate))
+                .route("/compile", post(compile))
+                .route("/execute", post(execute))
+                .route("/format", post(format))
+                .route("/clippy", post(clippy))
+                .route("/miri", post(miri))
+                .route("/macro-expansion", post(macro_expansion))
+                .route("/meta/crates", get_or_post(meta_crates))
+                .route("/meta/version/stable", get_or_post(meta_version_stable))
+                .route("/meta/version/beta", get_or_post(meta_version_beta))
+                .route("/meta/version/nightly", get_or_post(meta_version_nightly))
+                .route("/meta/version/rustfmt", get_or_post(meta_version_rustfmt))
+                .route("/meta/version/clippy", get_or_post(meta_version_clippy))
+                .route("/meta/version/miri", get_or_post(meta_version_miri))
+                .route("/meta/gist", post(meta_gist_create))
+                .route("/meta/gist/:id", get(meta_gist_get))
+                .route("/metrics", get(metrics)),
+        )
         .layer(Extension(Arc::new(SandboxCache::default())))
         .layer(Extension(config.github_token()));
 
