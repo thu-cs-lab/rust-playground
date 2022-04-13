@@ -1,3 +1,48 @@
+# Fork of Rust Playground
+
+Changes:
+
+1. Remove github gist
+2. Allow subpath deployment e.g. `/rust`
+
+How to deploy:
+
+1. Write `.env` like this:
+
+```env
+PLAYGROUND_UI_ROOT=./frontend/build
+# unused, write anything here
+PLAYGROUND_GITHUB_TOKEN=unused
+PLAYGROUND_UI_ADDRESS=0.0.0.0
+PLAYGROUND_PUBLIC_URL=/rust
+```
+
+2. Build frontend & backend:
+
+```shell
+cargo build --release
+cd ui/frontend
+PUBLIC_URL=/rust yarn build
+```
+
+3. Run playground backend as systemd service:
+
+```conf
+[Unit]
+Description=The Rust Playground
+
+[Service]
+Environment=RUST_LOG=info
+WorkingDirectory=/path/to/rust-playground/ui
+LimitNOFILE=65536
+User=play
+Group=play
+ExecStart=/path/to/rust-playground/ui/target/release/ui
+
+[Install]
+WantedBy=multi-user.target
+```
+
 # Rust Playground
 
 This is the home of the [Rust Playground][real],
