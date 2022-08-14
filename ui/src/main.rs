@@ -29,6 +29,7 @@ fn main() {
     server_axum::serve(config);
 }
 
+#[derive(Clone)]
 struct Config {
     address: String,
     cors_enabled: bool,

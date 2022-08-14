@@ -85,6 +85,7 @@ pub(crate) async fn serve(config: Config) {
         .route(&transform("/rust/play/meta/gist"), post(meta_gist_create))
         .route(&transform("/meta/gist/:id"), get(meta_gist_get))
         .route(&transform("/metrics"), get(metrics))
+        .layer(Extension(config.clone()))
         .layer(Extension(Arc::new(SandboxCache::default())))
         .layer(Extension(config.github_token()));
 
@@ -133,11 +134,13 @@ async fn strip_public_url<B>(
     mut req: Request<B>,
     next: middleware::Next<B>,
 ) -> impl IntoResponse {
+    let config: &Config = req.extensions().get().unwrap();
+    let public_url = config.public_url.clone();
+
     let uri = req.uri_mut();
     let uri_path = uri.path().to_string();
-    println!("Url is {:?}", uri);
-    if let Some(mut new_path) = uri_path.strip_prefix("/rust/play") {
-        println!("Rewrite from {:?}", uri);
+    if let Some(mut new_path) = uri_path.strip_prefix(&public_url) {
+        info!("Rewrite from {:?}", uri);
         let rewritten_uri = mem::take(uri);
         let mut parts = rewritten_uri.into_parts();
 
@@ -147,7 +150,7 @@ async fn strip_public_url<B>(
 
         parts.path_and_query = Some(PathAndQuery::from_str(new_path).unwrap());
         *uri = Uri::from_parts(parts).unwrap();
-        println!("Rewrite to {:?}", uri);
+        info!("Rewrite to {:?}", uri);
     }
     next.run(req).await
 }
