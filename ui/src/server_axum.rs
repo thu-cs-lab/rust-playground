@@ -41,6 +41,7 @@ use tower_http::{
     set_header::SetResponseHeader,
     trace::TraceLayer,
 };
+use log::info;
 
 const ONE_HOUR: Duration = Duration::from_secs(60 * 60);
 const CORS_CACHE_TIME_TO_LIVE: Duration = ONE_HOUR;
@@ -56,28 +57,30 @@ pub(crate) async fn serve(config: Config) {
     let root_files = static_file_service(config.root_path(), MAX_AGE_ONE_DAY);
     let asset_files = static_file_service(config.asset_path(), MAX_AGE_ONE_YEAR);
     let rewrite_help_as_index = middleware::from_fn(rewrite_help_as_index);
+    let strip_public_url = middleware::from_fn(strip_public_url);
 
     let mut app = Router::new()
         .fallback(root_files)
         .nest("/assets", asset_files)
         .layer(rewrite_help_as_index)
-        .route("/evaluate.json", post(evaluate))
-        .route("/compile", post(compile))
-        .route("/execute", post(execute))
-        .route("/format", post(format))
-        .route("/clippy", post(clippy))
-        .route("/miri", post(miri))
-        .route("/macro-expansion", post(macro_expansion))
-        .route("/meta/crates", get_or_post(meta_crates))
-        .route("/meta/version/stable", get_or_post(meta_version_stable))
-        .route("/meta/version/beta", get_or_post(meta_version_beta))
-        .route("/meta/version/nightly", get_or_post(meta_version_nightly))
-        .route("/meta/version/rustfmt", get_or_post(meta_version_rustfmt))
-        .route("/meta/version/clippy", get_or_post(meta_version_clippy))
-        .route("/meta/version/miri", get_or_post(meta_version_miri))
-        .route("/meta/gist", post(meta_gist_create))
-        .route("/meta/gist/:id", get(meta_gist_get))
-        .route("/metrics", get(metrics))
+        .layer(strip_public_url)
+        .route(&(config.public_url.clone() + "/evaluate.json"), post(evaluate))
+        .route(&(config.public_url.clone() + "/compile"), post(compile))
+        .route(&(config.public_url.clone() + "/execute"), post(execute))
+        .route(&(config.public_url.clone() + "/format"), post(format))
+        .route(&(config.public_url.clone() + "/clippy"), post(clippy))
+        .route(&(config.public_url.clone() + "/miri"), post(miri))
+        .route(&(config.public_url.clone() + "/macro-expansion"), post(macro_expansion))
+        .route(&(config.public_url.clone() + "/meta/crates"), get_or_post(meta_crates))
+        .route(&(config.public_url.clone() + "/meta/version/stable"), get_or_post(meta_version_stable))
+        .route(&(config.public_url.clone() + "/meta/version/beta"), get_or_post(meta_version_beta))
+        .route(&(config.public_url.clone() + "/meta/version/nightly"), get_or_post(meta_version_nightly))
+        .route(&(config.public_url.clone() + "/meta/version/rustfmt"), get_or_post(meta_version_rustfmt))
+        .route(&(config.public_url.clone() + "/meta/version/clippy"), get_or_post(meta_version_clippy))
+        .route(&(config.public_url.clone() + "/meta/version/miri"), get_or_post(meta_version_miri))
+        .route(&(config.public_url.clone() + "/rust/play/meta/gist"), post(meta_gist_create))
+        .route(&(config.public_url.clone() + "/meta/gist/:id"), get(meta_gist_get))
+        .route(&(config.public_url.clone() + "/metrics"), get(metrics))
         .layer(Extension(Arc::new(SandboxCache::default())))
         .layer(Extension(config.github_token()));
 
@@ -120,6 +123,29 @@ fn static_file_service(root: impl AsRef<path::Path>, max_age: HeaderValue) -> Me
             format!("Unhandled internal error: {}", e),
         )
     })
+}
+
+async fn strip_public_url<B>(
+    mut req: Request<B>,
+    next: middleware::Next<B>,
+) -> impl IntoResponse {
+    let uri = req.uri_mut();
+    let uri_path = uri.path().to_string();
+    println!("Url is {:?}", uri);
+    if let Some(mut new_path) = uri_path.strip_prefix("/rust/play") {
+        println!("Rewrite from {:?}", uri);
+        let rewritten_uri = mem::take(uri);
+        let mut parts = rewritten_uri.into_parts();
+
+        if new_path.len() == 0 {
+            new_path = "/";
+        }
+
+        parts.path_and_query = Some(PathAndQuery::from_str(new_path).unwrap());
+        *uri = Uri::from_parts(parts).unwrap();
+        println!("Rewrite to {:?}", uri);
+    }
+    next.run(req).await
 }
 
 async fn rewrite_help_as_index<B>(
@@ -354,11 +380,11 @@ async fn meta_gist_create(
     Json(req): Json<MetaGistCreateRequest>,
 ) -> Result<Json<MetaGistResponse>> {
     let token = String::clone(&token.0);
-    gist::create_future(token, req.code)
-        .await
-        .map(Into::into)
-        .map(Json)
-        .context(GistCreationSnafu)
+    Ok(Json(MetaGistResponse {
+        id: String::new(),
+        url: String::new(),
+        code: req.code,
+    }))
 }
 
 async fn meta_gist_get(
