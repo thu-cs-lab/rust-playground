@@ -82,7 +82,7 @@ pub(crate) async fn serve(config: Config) {
         .route(&transform("/meta/version/rustfmt"), get_or_post(meta_version_rustfmt))
         .route(&transform("/meta/version/clippy"), get_or_post(meta_version_clippy))
         .route(&transform("/meta/version/miri"), get_or_post(meta_version_miri))
-        .route(&transform("/rust/play/meta/gist"), post(meta_gist_create))
+        .route(&transform("/meta/gist"), post(meta_gist_create))
         .route(&transform("/meta/gist/:id"), get(meta_gist_get))
         .route(&transform("/metrics"), get(metrics))
         .layer(Extension(config.clone()))
