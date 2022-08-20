@@ -28,7 +28,34 @@ RSpec.feature "Automatically selecting the primary action", type: :feature, js: 
     click_on("Build")
 
     within(:output, :stderr) do
-      expect(page).to have_content 'function is never used: `main`'
+      expect(page).to have_content 'function `main` is never used'
+    end
+  end
+
+  scenario "when the crate is a procedural macro" do
+    editor.set <<~EOF
+      #![crate_type = "proc-macro"]
+
+      use proc_macro::TokenStream;
+
+      /// Example:
+      /// ```
+      /// playground::demo!();
+      /// type T = aaa;
+      /// ```
+      #[proc_macro]
+      pub fn demo(_input: TokenStream) -> TokenStream {
+          eprintln!("wow wow");
+          "struct Aaa;".parse().unwrap()
+      }
+
+      /*
+      #[test]*/
+    EOF
+    click_on("Test")
+
+    within(:output, :stdout) do
+      expect(page).to have_content 'a struct with a similar name exists: `Aaa`'
     end
   end
 
@@ -48,7 +75,7 @@ RSpec.feature "Automatically selecting the primary action", type: :feature, js: 
     click_on("Build")
 
     within(:output, :stderr) do
-      expect(page).to have_content 'function is never used: `main`'
+      expect(page).to have_content 'function `main` is never used'
     end
   end
 
@@ -107,7 +134,7 @@ RSpec.feature "Automatically selecting the primary action", type: :feature, js: 
     click_on("Build")
 
     within(:output, :stderr) do
-      expect(page).to have_content 'function is never used: `arbitrary_code`'
+      expect(page).to have_content 'function `arbitrary_code` is never used'
     end
   end
 
