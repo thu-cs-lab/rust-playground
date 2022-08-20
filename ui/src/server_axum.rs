@@ -386,7 +386,7 @@ async fn meta_gist_create(
     Extension(token): Extension<GhToken>,
     Json(req): Json<MetaGistCreateRequest>,
 ) -> Result<Json<MetaGistResponse>> {
-    let token = String::clone(&token.0);
+    let token = token.must_get()?;
     Ok(Json(MetaGistResponse {
         id: String::new(),
         url: String::new(),
@@ -398,7 +398,7 @@ async fn meta_gist_get(
     Extension(token): Extension<GhToken>,
     Path(id): Path<String>,
 ) -> Result<Json<MetaGistResponse>> {
-    let token = String::clone(&token.0);
+    let token = token.must_get()?;
     gist::load_future(token, &id)
         .await
         .map(Into::into)
