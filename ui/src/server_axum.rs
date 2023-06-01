@@ -63,9 +63,7 @@ pub(crate) async fn serve(config: Config) {
     let rewrite_help_as_index = middleware::from_fn(rewrite_help_as_index);
     let strip_public_url = middleware::from_fn(strip_public_url);
 
-    let transform = |s: &str| {
-        format!("{}{}", config.public_url, s)
-    };
+    let transform = |s: &str| format!("{}{}", config.public_url, s);
 
     let mut app = Router::new()
         .fallback_service(root_files)
@@ -80,12 +78,30 @@ pub(crate) async fn serve(config: Config) {
         .route(&transform("/miri"), post(miri))
         .route(&transform("/macro-expansion"), post(macro_expansion))
         .route(&transform("/meta/crates"), get_or_post(meta_crates))
-        .route(&transform("/meta/version/stable"), get_or_post(meta_version_stable))
-        .route(&transform("/meta/version/beta"), get_or_post(meta_version_beta))
-        .route(&transform("/meta/version/nightly"), get_or_post(meta_version_nightly))
-        .route(&transform("/meta/version/rustfmt"), get_or_post(meta_version_rustfmt))
-        .route(&transform("/meta/version/clippy"), get_or_post(meta_version_clippy))
-        .route(&transform("/meta/version/miri"), get_or_post(meta_version_miri))
+        .route(
+            &transform("/meta/version/stable"),
+            get_or_post(meta_version_stable),
+        )
+        .route(
+            &transform("/meta/version/beta"),
+            get_or_post(meta_version_beta),
+        )
+        .route(
+            &transform("/meta/version/nightly"),
+            get_or_post(meta_version_nightly),
+        )
+        .route(
+            &transform("/meta/version/rustfmt"),
+            get_or_post(meta_version_rustfmt),
+        )
+        .route(
+            &transform("/meta/version/clippy"),
+            get_or_post(meta_version_clippy),
+        )
+        .route(
+            &transform("/meta/version/miri"),
+            get_or_post(meta_version_miri),
+        )
         .route(&transform("/meta/gist"), post(meta_gist_create))
         .route(&transform("/meta/gist/"), post(meta_gist_create)) // compatibility with lax frontend code
         .route(&transform("/meta/gist/:id"), get(meta_gist_get))
@@ -133,27 +149,25 @@ fn static_file_service(root: impl AsRef<path::Path>, max_age: HeaderValue) -> Me
     get_service(with_caching)
 }
 
-async fn strip_public_url<B>(
-    mut req: Request<B>,
-    next: middleware::Next<B>,
-) -> impl IntoResponse {
+async fn strip_public_url<B>(mut req: Request<B>, next: middleware::Next<B>) -> impl IntoResponse {
     let config: &Config = req.extensions().get().unwrap();
     let public_url = config.public_url.clone();
 
     let uri = req.uri_mut();
-    let uri_path = uri.path().to_string();
-    if let Some(mut new_path) = uri_path.strip_prefix(&public_url) {
-        info!("Rewrite from {:?}", uri);
-        let rewritten_uri = mem::take(uri);
-        let mut parts = rewritten_uri.into_parts();
+    if let Some(path_and_query) = uri.path_and_query() {
+        if let Some(mut new_path) = path_and_query.as_str().strip_prefix(&public_url) {
+            info!("Rewrite from {:?}", uri);
+            let rewritten_uri = uri.clone();
+            let mut parts = rewritten_uri.into_parts();
 
-        if new_path.len() == 0 {
-            new_path = "/";
+            if new_path.len() == 0 {
+                new_path = "/";
+            }
+
+            parts.path_and_query = Some(PathAndQuery::from_str(new_path).unwrap());
+            *uri = Uri::from_parts(parts).unwrap();
+            info!("Rewrite to {:?}", uri);
         }
-
-        parts.path_and_query = Some(PathAndQuery::from_str(new_path).unwrap());
-        *uri = Uri::from_parts(parts).unwrap();
-        info!("Rewrite to {:?}", uri);
     }
     next.run(req).await
 }
