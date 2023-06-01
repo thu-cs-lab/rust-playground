@@ -43,7 +43,7 @@ use tower_http::{
     set_header::SetResponseHeader,
     trace::TraceLayer,
 };
-use log::info;
+use tracing::info;
 
 const ONE_HOUR: Duration = Duration::from_secs(60 * 60);
 const CORS_CACHE_TIME_TO_LIVE: Duration = ONE_HOUR;
