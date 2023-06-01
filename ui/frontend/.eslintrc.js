@@ -62,8 +62,14 @@ module.exports = {
     {
       files: [
         '.eslintrc.js',
+        'PopButton.tsx',
         'editor/AceEditor.tsx',
         'editor/SimpleEditor.tsx',
+        'reducers/output/execute.ts',
+        'reducers/output/format.ts',
+        'reducers/output/gist.ts',
+        'reducers/websocket.ts',
+        'websocketActions.ts',
         'websocketMiddleware.ts',
       ],
       extends: ['prettier'],

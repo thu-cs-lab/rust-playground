@@ -1,16 +1,18 @@
-import { Middleware } from 'redux';
+import { AnyAction, Middleware } from '@reduxjs/toolkit';
 import { z } from 'zod';
 
+import { wsExecuteResponseSchema } from './reducers/output/execute';
 import {
-  ActionType,
-  WSExecuteResponse,
-  WebSocketError,
   websocketConnected,
   websocketDisconnected,
   websocketError,
-} from './actions';
+  websocketErrorSchema,
+} from './reducers/websocket';
 
-const WSMessageResponse = z.discriminatedUnion('type', [WebSocketError, WSExecuteResponse]);
+const WSMessageResponse = z.discriminatedUnion('type', [
+  websocketErrorSchema,
+  wsExecuteResponseSchema,
+]);
 
 const reportWebSocketError = async (error: string) => {
   try {
@@ -44,6 +46,8 @@ const openWebSocket = (currentLocation: Location) => {
 // https://exponentialbackoffcalculator.com
 const backoffMs = (n: number) => Math.min(100 * Math.pow(2, n), 10000);
 
+const idleTimeoutMs = 60 * 60 * 1000;
+
 export const websocketMiddleware =
   (window: Window): Middleware =>
   (store) => {
@@ -51,10 +55,26 @@ export const websocketMiddleware =
     let wasConnected = false;
     let reconnectAttempt = 0;
 
+    let timeout: number | null = null;
+    const resetTimeout = () => {
+      if (timeout) {
+        window.clearTimeout(timeout);
+      }
+
+      timeout = window.setTimeout(() => {
+        if (!socket) {
+          return;
+        }
+
+        socket.close();
+      }, idleTimeoutMs);
+    };
+
     const connect = () => {
       socket = openWebSocket(window.location);
-
       if (socket) {
+        resetTimeout();
+
         socket.addEventListener('open', () => {
           store.dispatch(websocketConnected());
 
@@ -76,7 +96,7 @@ export const websocketMiddleware =
           // We cannot get detailed information about the failure
           // https://stackoverflow.com/a/31003057/155423
           const error = 'Generic WebSocket Error';
-          store.dispatch(websocketError(error));
+          store.dispatch(websocketError({ error }));
           reportWebSocketError(error);
         });
 
@@ -85,6 +105,7 @@ export const websocketMiddleware =
             const rawMessage = JSON.parse(event.data);
             const message = WSMessageResponse.parse(rawMessage);
             store.dispatch(message);
+            resetTimeout();
           } catch (e) {
             console.log('Unable to parse WebSocket message', event.data, e);
           }
@@ -110,10 +131,11 @@ export const websocketMiddleware =
       if (socket && socket.readyState == socket.OPEN && sendActionOnWebsocket(action)) {
         const message = JSON.stringify(action);
         socket.send(message);
+        resetTimeout();
       }
 
       next(action);
     };
   };
 
-const sendActionOnWebsocket = (action: any): boolean => action.type === ActionType.WSExecuteRequest;
+const sendActionOnWebsocket = (action: AnyAction): boolean => action?.meta?.websocket;
