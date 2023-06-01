@@ -8,7 +8,6 @@ import initializeLocalStorage from './local_storage';
 import initializeSessionStorage from './session_storage';
 import playgroundApp, { State } from './reducers';
 import { websocketMiddleware } from './websocketMiddleware';
-import { eventListeners } from '@popperjs/core';
 
 export default function configureStore(window: Window) {
   const baseUrl = new URL(process.env.PUBLIC_URL || '/', window.location.href).href;
