@@ -7,6 +7,7 @@ import { State } from '../reducers';
 import * as selectors from '../selectors';
 
 import Loader from './Loader';
+import Section from './Section';
 
 import styles from './Gist.module.css';
 
@@ -58,6 +59,7 @@ const Links: React.FC = () => {
   const gistUrl = useSelector((state: State) => state.output.gist.url);
   const permalink = useSelector(selectors.permalinkSelector);
   const urloUrl = useSelector(selectors.urloUrlSelector);
+  const textChanged = useSelector(selectors.textChangedSinceShareSelector);
 
   return (
     <Fragment>
@@ -70,6 +72,9 @@ const Links: React.FC = () => {
       }
       <Copied href={codeUrl}>Embedded code in link</Copied>
       <NewWindow href={urloUrl}>Open a new thread in the Rust user forum</NewWindow>
+      {textChanged ? <Section kind="warning" label="Code changed">
+        Source code has been changed since gist was saved
+      </Section>: null }
     </Fragment>
   );
 };
