@@ -20,8 +20,11 @@ PLAYGROUND_PUBLIC_URL=/rust
 2. Build frontend & backend:
 
 ```shell
+cd compiler
+./fetch.sh
+cd ../ui
 cargo build --release
-cd ui/frontend
+cd frontend
 PUBLIC_URL=/rust yarn build
 ```
 
