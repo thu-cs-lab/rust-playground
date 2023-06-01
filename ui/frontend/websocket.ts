@@ -1,6 +1,6 @@
 async function reportWebSocketError() {
   try {
-    await fetch('/nowebsocket', {
+    await fetch(process.env.PUBLIC_URL + '/nowebsocket', {
       method: 'post',
       headers: {
         'Content-Length': '0',
@@ -14,7 +14,7 @@ async function reportWebSocketError() {
 export default function openWebSocket(currentLocation: Location) {
   try {
     const wsProtocol = currentLocation.protocol === 'https:' ? 'wss://' : 'ws://';
-    const wsUri = [wsProtocol, currentLocation.host, '/websocket'].join('');
+    const wsUri = [wsProtocol, currentLocation.host, process.env.PUBLIC_URL, '/websocket'].join('');
     const ws = new WebSocket(wsUri);
     ws.addEventListener('error', () => reportWebSocketError());
     return ws;
