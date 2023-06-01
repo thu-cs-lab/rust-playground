@@ -1,18 +1,18 @@
-import { merge } from 'lodash';
+import { merge } from 'lodash-es';
 import { applyMiddleware, compose, createStore } from 'redux';
 import { useDispatch } from 'react-redux';
 import thunk, { ThunkDispatch } from 'redux-thunk';
-import * as url from 'url';
 
 import { Action, initializeApplication } from './actions';
 import initializeLocalStorage from './local_storage';
 import initializeSessionStorage from './session_storage';
 import playgroundApp, { State } from './reducers';
 import { websocketMiddleware } from './websocketMiddleware';
+import { eventListeners } from '@popperjs/core';
 
 export default function configureStore(window: Window) {
-  const baseUrl = url.resolve(window.location.href, process.env.PUBLIC_URL || '/');
->>>>>>> c6165a36923db5d99313e6056b5b610a2ede5bb0
+  const baseUrl = new URL(process.env.PUBLIC_URL || '/', window.location.href).href;
+  const websocket = websocketMiddleware(window);
 
   const initialGlobalState = {
     globalConfiguration: {

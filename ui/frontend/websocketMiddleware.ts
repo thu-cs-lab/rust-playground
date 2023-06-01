@@ -14,7 +14,7 @@ const WSMessageResponse = z.discriminatedUnion('type', [WebSocketError, WSExecut
 
 const reportWebSocketError = async (error: string) => {
   try {
-    await fetch('/nowebsocket', {
+    await fetch(process.env.PUBLIC_URL + '/nowebsocket', {
       method: 'post',
       headers: {
         'Content-Type': 'application/json',
@@ -29,7 +29,7 @@ const reportWebSocketError = async (error: string) => {
 const openWebSocket = (currentLocation: Location) => {
   try {
     const wsProtocol = currentLocation.protocol === 'https:' ? 'wss://' : 'ws://';
-    const wsUri = [wsProtocol, currentLocation.host, '/websocket'].join('');
+    const wsUri = [wsProtocol, currentLocation.host, process.env.PUBLIC_URL, '/websocket'].join('');
     return new WebSocket(wsUri);
   } catch (e) {
     // WebSocket URL error or WebSocket is not supported by browser.
