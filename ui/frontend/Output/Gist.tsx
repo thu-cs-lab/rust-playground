@@ -21,6 +21,7 @@ const Gist: React.FC = () => {
 };
 
 interface CopiedProps {
+  children: React.ReactNode;
   href: string;
 }
 
@@ -74,6 +75,7 @@ const Links: React.FC = () => {
 };
 
 interface NewWindowProps {
+  children: React.ReactNode;
   href: string;
 }
 
