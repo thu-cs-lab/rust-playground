@@ -1,6 +1,8 @@
 import { AsyncThunk, createAsyncThunk } from '@reduxjs/toolkit';
+import * as z from 'zod';
 
-import { SimpleThunkAction, adaptFetchError, jsonPost, routes } from './actions';
+import { ThunkAction } from './actions';
+import { jsonPost, routes } from './api';
 import { compileRequestPayloadSelector } from './selectors';
 
 interface CompileRequestBody {
@@ -17,11 +19,12 @@ interface CompileRequestBody {
   processAssembly: string;
 }
 
-interface CompileResponseBody {
-  code: string;
-  stdout: string;
-  stderr: string;
-}
+const CompileResponseBody = z.object({
+  code: z.string(),
+  stdout: z.string(),
+  stderr: z.string(),
+});
+type CompileResponseBody = z.infer<typeof CompileResponseBody>;
 
 interface Props {
   sliceName: string;
@@ -29,16 +32,17 @@ interface Props {
 }
 
 interface CompileActions {
-  action: AsyncThunk<CompileResponseBody, CompileRequestBody, {}>;
-  performCompile: () => SimpleThunkAction;
+  action: AsyncThunk<CompileResponseBody, CompileRequestBody, object>;
+  performCompile: () => ThunkAction;
 }
 
 export const makeCompileActions = ({ sliceName, target }: Props): CompileActions => {
-  const action = createAsyncThunk(sliceName, async (payload: CompileRequestBody) =>
-    adaptFetchError(() => jsonPost<CompileResponseBody>(routes.compile, payload)),
-  );
+  const action = createAsyncThunk(sliceName, async (payload: CompileRequestBody) => {
+    const d = await jsonPost(routes.compile, payload);
+    return CompileResponseBody.parseAsync(d);
+  });
 
-  const performCompile = (): SimpleThunkAction => (dispatch, getState) => {
+  const performCompile = (): ThunkAction => (dispatch, getState) => {
     const state = getState();
     const body = compileRequestPayloadSelector(state, { target });
     dispatch(action(body));

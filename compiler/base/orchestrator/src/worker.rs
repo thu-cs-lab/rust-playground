@@ -31,11 +31,13 @@
 //!   - [`tokio::process::ChildStderr`][]
 //!
 
+use futures::FutureExt as _;
 use snafu::prelude::*;
 use std::{
     collections::HashMap,
     io,
     path::{Path, PathBuf},
+    pin::pin,
     process::{ExitStatus, Stdio},
 };
 use tokio::{
@@ -46,16 +48,16 @@ use tokio::{
     sync::mpsc,
     task::JoinSet,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::sync::{CancellationToken, DropGuard};
 
 use crate::{
     bincode_input_closed,
     message::{
         CoordinatorMessage, DeleteFileRequest, DeleteFileResponse, ExecuteCommandRequest,
         ExecuteCommandResponse, JobId, Multiplexed, ReadFileRequest, ReadFileResponse,
-        SerializedError, WorkerMessage, WriteFileRequest, WriteFileResponse,
+        SerializedError2, WorkerMessage, WriteFileRequest, WriteFileResponse,
     },
-    DropErrorDetailsExt,
+    DropErrorDetailsExt as _, TaskAbortExt as _,
 };
 
 pub async fn listen(project_dir: impl Into<PathBuf>) -> Result<(), Error> {
@@ -66,14 +68,16 @@ pub async fn listen(project_dir: impl Into<PathBuf>) -> Result<(), Error> {
     let mut io_tasks = spawn_io_queue(coordinator_msg_tx, worker_msg_rx);
 
     let (process_tx, process_rx) = mpsc::channel(8);
-    let process_task = tokio::spawn(manage_processes(process_rx, project_dir.clone()));
+    let process_task =
+        tokio::spawn(manage_processes(process_rx, project_dir.clone())).abort_on_drop();
 
     let handler_task = tokio::spawn(handle_coordinator_message(
         coordinator_msg_rx,
         worker_msg_tx,
         project_dir,
         process_tx,
-    ));
+    ))
+    .abort_on_drop();
 
     select! {
         Some(io_task) = io_tasks.join_next() => {
@@ -268,7 +272,7 @@ impl MultiplexingSender {
     }
 
     async fn send_err(&self, e: impl std::error::Error) -> Result<(), MultiplexingSenderError> {
-        self.send_raw(WorkerMessage::Error(SerializedError::new(e)))
+        self.send_raw(WorkerMessage::Error2(SerializedError2::new(e)))
             .await
     }
 
@@ -403,7 +407,7 @@ struct ProcessState {
     processes: JoinSet<Result<(), ProcessError>>,
     stdin_senders: HashMap<JobId, mpsc::Sender<String>>,
     stdin_shutdown_tx: mpsc::Sender<JobId>,
-    kill_tokens: HashMap<JobId, CancellationToken>,
+    kill_tokens: HashMap<JobId, DropGuard>,
 }
 
 impl ProcessState {
@@ -447,15 +451,32 @@ impl ProcessState {
             }
         };
 
+        let statistics_task = tokio::task::spawn_blocking({
+            let child_id = child.id();
+            let worker_msg_tx = worker_msg_tx.clone();
+            let handle = tokio::runtime::Handle::current();
+            move || stream_command_statistics(child_id, worker_msg_tx, handle)
+        });
+
         let task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, stdin, stdout, stderr);
 
-        self.kill_tokens.insert(job_id, token.clone());
+        self.kill_tokens.insert(job_id, token.clone().drop_guard());
 
         self.processes.spawn({
             let stdin_shutdown_tx = self.stdin_shutdown_tx.clone();
             async move {
+                let message = process_end(
+                    token,
+                    child,
+                    task_set,
+                    statistics_task,
+                    stdin_shutdown_tx,
+                    job_id,
+                )
+                .await;
+
                 worker_msg_tx
-                    .send(process_end(token, child, task_set, stdin_shutdown_tx, job_id).await)
+                    .send(message)
                     .await
                     .context(UnableToSendExecuteCommandResponseSnafu)
             }
@@ -491,8 +512,8 @@ impl ProcessState {
     }
 
     fn kill(&mut self, job_id: JobId) {
-        if let Some(token) = self.kill_tokens.get(&job_id) {
-            token.cancel();
+        if let Some(token) = self.kill_tokens.remove(&job_id) {
+            drop(token);
         }
     }
 }
@@ -590,17 +611,34 @@ async fn process_end(
     token: CancellationToken,
     mut child: Child,
     mut task_set: JoinSet<Result<(), StdioError>>,
+    statistics_task: tokio::task::JoinHandle<Result<(), CommandStatisticsError>>,
     stdin_shutdown_tx: mpsc::Sender<JobId>,
     job_id: JobId,
 ) -> Result<ExecuteCommandResponse, ProcessError> {
     use process_error::*;
 
-    select! {
-        () = token.cancelled() => child.kill().await.context(KillChildSnafu)?,
-        _ = child.wait() => {},
+    let mut cancelled = pin!(token.cancelled().fuse());
+
+    let status = loop {
+        select! {
+            // The user requested that the process be killed
+            () = &mut cancelled => {
+                child.kill().await.context(KillChildSnafu)?;
+            },
+
+            // The process exited normally
+            status = child.wait() => break status,
+
+            // One of our tasks exited unexpectedly
+            // TODO: dedupe errors or fully split them
+            Some(task) = task_set.join_next() => {
+                task.context(StdioTaskPanickedSnafu)?
+                    .context(StdioTaskFailedSnafu)?;
+            },
+        };
     };
 
-    let status = child.wait().await.context(WaitChildSnafu)?;
+    let status = status.context(WaitChildSnafu)?;
 
     stdin_shutdown_tx
         .send(job_id)
@@ -608,10 +646,17 @@ async fn process_end(
         .drop_error_details()
         .context(UnableToSendStdinShutdownSnafu)?;
 
+    // Check any remaining tasks to see if they had an error
     while let Some(task) = task_set.join_next().await {
         task.context(StdioTaskPanickedSnafu)?
             .context(StdioTaskFailedSnafu)?;
     }
+
+    // TODO: check this for death earlier?
+    statistics_task
+        .await
+        .context(StatisticsTaskPanickedSnafu)?
+        .context(StatisticsTaskFailedSnafu)?;
 
     let success = status.success();
     let exit_detail = extract_exit_detail(status);
@@ -754,6 +799,12 @@ pub enum ProcessError {
     #[snafu(display("The command's stdio task failed"))]
     StdioTaskFailed { source: StdioError },
 
+    #[snafu(display("The command's statistics task panicked"))]
+    StatisticsTaskPanicked { source: tokio::task::JoinError },
+
+    #[snafu(display("The command's statistics task failed"))]
+    StatisticsTaskFailed { source: CommandStatisticsError },
+
     #[snafu(display("Failed to send the command started response to the coordinator"))]
     UnableToSendExecuteCommandStartedResponse { source: MultiplexingSenderError },
 
@@ -765,6 +816,183 @@ pub enum ProcessError {
 
     #[snafu(display("The process task panicked"))]
     ProcessTaskPanicked { source: tokio::task::JoinError },
+}
+
+#[cfg(target_os = "macos")]
+mod stats {
+    use mach2::mach_time::{mach_timebase_info, mach_timebase_info_data_t};
+    use snafu::prelude::*;
+    use std::mem::MaybeUninit;
+
+    use crate::message::CommandStatistics;
+
+    pub struct Process {
+        pid: i32,
+        timebase: mach_timebase_info_data_t,
+    }
+
+    impl Process {
+        pub fn new(pid: i32) -> Result<Self, Error> {
+            let timebase = timebase()?;
+            Ok(Self { pid, timebase })
+        }
+
+        pub fn stats(&self) -> Option<CommandStatistics> {
+            let usage = proc_pid_rusage(self.pid).ok()?;
+
+            let total_time_secs = self.ticks_to_seconds(usage.ri_user_time + usage.ri_system_time);
+            let resident_set_size_bytes = usage.ri_resident_size;
+
+            Some(CommandStatistics {
+                total_time_secs,
+                resident_set_size_bytes,
+            })
+        }
+
+        fn ticks_to_seconds(&self, v: u64) -> f64 {
+            let nanos = v as f64 / self.timebase.denom as f64 * self.timebase.numer as f64;
+            nanos / 1_000_000_000.0
+        }
+    }
+
+    fn timebase() -> Result<mach_timebase_info_data_t, Error> {
+        let mut timebase = Default::default();
+
+        // SAFETY: We've initialized the data structure
+        let retval = unsafe { mach_timebase_info(&mut timebase) };
+
+        if retval != mach2::kern_return::KERN_SUCCESS {
+            Snafu.fail()
+        } else {
+            Ok(timebase)
+        }
+    }
+
+    fn proc_pid_rusage(pid: i32) -> std::io::Result<libc::rusage_info_v4> {
+        // SAFETY: We only access the usage information after checking
+        // the function call succeeded.
+        unsafe {
+            let mut ri = MaybeUninit::<libc::rusage_info_v4>::uninit();
+
+            let retval = libc::proc_pid_rusage(pid, libc::RUSAGE_INFO_V4, ri.as_mut_ptr().cast());
+
+            if retval == 0 {
+                Ok(ri.assume_init())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("Unable to get the timebase conversion"))]
+    pub struct Error;
+}
+
+#[cfg(target_os = "linux")]
+mod stats {
+    use procfs::process::Process as ProcfsProcess;
+    use snafu::prelude::*;
+
+    use crate::message::CommandStatistics;
+
+    pub struct Process {
+        process: ProcfsProcess,
+        ticks_per_second: u64,
+        page_size: u64,
+    }
+
+    impl Process {
+        pub fn new(pid: i32) -> Result<Self, Error> {
+            let process = ProcfsProcess::new(pid).context(Snafu)?;
+
+            let ticks_per_second = procfs::ticks_per_second();
+            let page_size = procfs::page_size();
+
+            Ok(Self {
+                process,
+                ticks_per_second,
+                page_size,
+            })
+        }
+
+        pub fn stats(&self) -> Option<CommandStatistics> {
+            let stat = self.process.stat().ok()?;
+
+            let total_time_secs = self.ticks_to_seconds(stat.utime + stat.stime);
+            let resident_set_size_bytes = self.pages_to_bytes(stat.rss);
+
+            Some(CommandStatistics {
+                total_time_secs,
+                resident_set_size_bytes,
+            })
+        }
+
+        fn ticks_to_seconds(&self, v: u64) -> f64 {
+            v as f64 / self.ticks_per_second as f64
+        }
+
+        fn pages_to_bytes(&self, v: u64) -> u64 {
+            v * self.page_size
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("Could not get information for the process"))]
+    pub struct Error {
+        source: procfs::ProcError,
+    }
+}
+
+fn stream_command_statistics(
+    child_id: Option<u32>,
+    worker_msg_tx: MultiplexingSender,
+    handle: tokio::runtime::Handle,
+) -> Result<(), CommandStatisticsError> {
+    use command_statistics_error::*;
+    use stats::*;
+    use std::time::Duration;
+
+    const STATISTIC_INTERVAL: Duration = Duration::from_secs(1);
+
+    let process_id = child_id.context(ChildIdMissingSnafu)?;
+
+    let process_id = process_id
+        .try_into()
+        .context(ProcessIdOutOfRangeSnafu { process_id })?;
+
+    let process = Process::new(process_id).context(InvalidProcessSnafu { process_id })?;
+
+    while let Some(stats) = process.stats() {
+        let sent = handle.block_on(worker_msg_tx.send_ok(stats));
+        if sent.is_err() {
+            // No one listening anymore
+            break;
+        }
+
+        std::thread::sleep(STATISTIC_INTERVAL);
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum CommandStatisticsError {
+    #[snafu(display("The child did not have a process ID"))]
+    ChildIdMissing,
+
+    #[snafu(display("The process ID {process_id} could not be converted"))]
+    ProcessIdOutOfRange {
+        source: std::num::TryFromIntError,
+        process_id: u32,
+    },
+
+    #[snafu(display("The process ID {process_id} is not valid"))]
+    InvalidProcess {
+        source: stats::Error,
+        process_id: i32,
+    },
 }
 
 fn stream_stdio(
@@ -863,11 +1091,11 @@ where
 
             // We can't parse any UTF-8
             if valid_utf_8_bytes == 0 {
+                // This should be enough bytes to get one UTF-8 character.
+                ensure!(n_valid < 4, InvalidUtf8Snafu);
+
                 // We aren't going to get any more input
                 ensure!(n_read != 0, RanOutOfInputSnafu);
-
-                // This should be enough bytes to get one UTF-8 character.
-                ensure!(n_valid < 4, InvalidUtf8Snafu)
             }
 
             // Safety: We just calculated the number of valid UTF-8 bytes
@@ -882,11 +1110,6 @@ where
             self.buffer.copy_within(valid_utf_8_bytes..n_valid, 0);
 
             self.n_incomplete = n_valid - valid_utf_8_bytes;
-            assert!(
-                self.n_incomplete < 4,
-                "Should never have 4 or more incomplete bytes, had {}",
-                self.n_incomplete,
-            );
 
             if !s.is_empty() {
                 return Ok(Some(s));
@@ -913,7 +1136,6 @@ pub enum Utf8BufReaderError {
 mod test {
     use std::{
         collections::VecDeque,
-        io,
         pin::Pin,
         task::{Context, Poll},
     };
@@ -994,6 +1216,18 @@ mod test {
     }
 
     #[tokio::test]
+    async fn valid_followed_by_invalid_utf8() {
+        let bytes = [b'A', 0xc3, 0x28, 0xc3, 0x28, 0xc3, 0x28];
+
+        let reader = FixedAsyncRead::success_exact([bytes]);
+        let mut buffer = Utf8BufReader::new(reader);
+
+        assert_matches!(buffer.next().await, Ok(Some(s)) => s == "A");
+        assert_matches!(buffer.next().await, Err(Utf8BufReaderError::InvalidUtf8));
+        assert!(buffer.reader.is_empty());
+    }
+
+    #[tokio::test]
     async fn split_across_responses() {
         let bytes: [u8; 12] = "🙂🙂🙂".as_bytes().try_into().unwrap();
 
@@ -1008,6 +1242,8 @@ mod test {
     }
 }
 
+const OUTPUT_BYTE_LIMIT: usize = 640 * 1024;
+
 async fn copy_child_output(
     output: impl AsyncRead + Unpin,
     coordinator_tx: MultiplexingSender,
@@ -1016,16 +1252,27 @@ async fn copy_child_output(
     use copy_child_output_error::*;
 
     let mut buf = Utf8BufReader::new(output);
+    let mut n_total_bytes: usize = 0;
 
     while let Some(buffer) = buf.next().await.context(UnableToReadSnafu)? {
+        let n_bytes = buffer.len();
+
         coordinator_tx
             .send_ok(xform(buffer))
             .await
             .context(UnableToSendSnafu)?;
+
+        n_total_bytes = n_total_bytes.saturating_add(n_bytes);
+        ensure!(
+            n_total_bytes <= OUTPUT_BYTE_LIMIT,
+            TooManyBytesSnafu { n_total_bytes }
+        );
     }
 
     Ok(())
 }
+
+const BYTE_LIMIT_URL: &str = "https://github.com/rust-lang/rust-playground/discussions/1027";
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
@@ -1035,6 +1282,11 @@ pub enum CopyChildOutputError {
 
     #[snafu(display("Failed to send output packet"))]
     UnableToSend { source: MultiplexingSenderError },
+
+    #[snafu(display(
+        "Generated {n_total_bytes} bytes of output, exiting (640K ought to be enough for anybody). If this was not an accident, tell us more at {BYTE_LIMIT_URL}"
+    ))]
+    TooManyBytes { n_total_bytes: usize },
 }
 
 // stdin/out <--> messages.

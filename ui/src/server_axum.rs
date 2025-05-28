@@ -1,66 +1,85 @@
 use crate::{
     gist,
     metrics::{
-        record_metric, track_metric_async, track_metric_no_request_async, Endpoint, GenerateLabels,
-        HasLabelsCore, Outcome, SuccessDetails, UNAVAILABLE_WS,
+        record_metric, track_metric_no_request_async, Endpoint, HasLabelsCore, Outcome,
+        UNAVAILABLE_WS,
     },
-    sandbox::{self, Channel, Sandbox, DOCKER_PROCESS_TIMEOUT_SOFT},
-    CachingSnafu, ClippyRequest, ClippyResponse, ClippySnafu, CompileRequest, CompileResponse,
-    CompileSnafu, Config, Error, ErrorJson, EvaluateRequest, EvaluateResponse, EvaluateSnafu,
-    ExecuteRequest, ExecuteResponse, ExecuteSnafu, ExpansionSnafu, FormatRequest, FormatResponse,
-    FormatSnafu, GhToken, GistCreationSnafu, GistLoadingSnafu, InterpretingSnafu,
-    MacroExpansionRequest, MacroExpansionResponse, MetaCratesResponse, MetaGistCreateRequest,
-    MetaGistResponse, MetaVersionResponse, MetricsToken, MiriRequest, MiriResponse, Result,
-    SandboxCreationSnafu, ShutdownCoordinatorSnafu, TimeoutSnafu,
+    request_database::Handle,
+    Config, GhToken, MetricsToken, WebSocketConfig,
 };
-use async_trait::async_trait;
 use axum::{
-    extract::{self, ws::WebSocketUpgrade, Extension, Path, TypedHeader},
+    body::Body,
+    extract::{self, ws::WebSocketUpgrade, Extension, Path},
     handler::Handler,
-    headers::{authorization::Bearer, Authorization, CacheControl, ETag, IfNoneMatch},
     http::{
-        header, request::Parts, uri::PathAndQuery, HeaderValue, Method, Request, StatusCode, Uri,
+        header, request::Parts, uri::PathAndQuery, HeaderName, HeaderValue, Method, Request,
+        StatusCode, Uri,
     },
     middleware,
     response::IntoResponse,
     routing::{get, get_service, post, MethodRouter},
     Router,
 };
-use futures::{future::BoxFuture, FutureExt};
-use orchestrator::coordinator::{self, DockerBackend};
-use snafu::{prelude::*, IntoError};
+use axum_extra::{
+    headers::{authorization::Bearer, Authorization, CacheControl, ETag, IfNoneMatch},
+    TypedHeader,
+};
+use futures::{future::BoxFuture, FutureExt, TryFutureExt};
+use orchestrator::coordinator::{self, CoordinatorFactory, DockerBackend, TRACKED_CONTAINERS};
+use snafu::prelude::*;
 use std::{
-    convert::{TryFrom, TryInto},
+    convert::TryInto,
     future::Future,
     mem, path,
     str::FromStr,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    sync::{Arc, LazyLock},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
-use tokio::sync::Mutex;
+use tokio::{select, sync::mpsc};
 use tower_http::{
     cors::{self, CorsLayer},
+    request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer},
     services::ServeDir,
     set_header::SetResponseHeader,
     trace::TraceLayer,
 };
-use tracing::info;
+use tracing::{info, error, error_span, field};
+
+use crate::{env::PLAYGROUND_GITHUB_TOKEN, public_http_api as api};
+
+use cache::{
+    cache_task, CacheTaskItem, CacheTx, CacheTxError, Stamped, SANDBOX_CACHE_TIME_TO_LIVE,
+};
 
 const ONE_HOUR: Duration = Duration::from_secs(60 * 60);
-const CORS_CACHE_TIME_TO_LIVE: Duration = ONE_HOUR;
 
-const TEN_MINUTES: Duration = Duration::from_secs(10 * 60);
-const SANDBOX_CACHE_TIME_TO_LIVE: Duration = TEN_MINUTES;
+const CORS_CACHE_TIME_TO_LIVE: Duration = ONE_HOUR;
 
 const MAX_AGE_ONE_DAY: HeaderValue = HeaderValue::from_static("public, max-age=86400");
 const MAX_AGE_ONE_YEAR: HeaderValue = HeaderValue::from_static("public, max-age=31536000");
 
+const DOCKER_PROCESS_TIMEOUT_SOFT: Duration = Duration::from_secs(10);
+
+mod cache;
 mod websocket;
-pub use websocket::CoordinatorManagerError as WebsocketCoordinatorManagerError;
-pub(crate) use websocket::ExecuteError as WebsocketExecuteError;
+
+#[derive(Debug, Clone)]
+struct Factory(Arc<CoordinatorFactory>);
 
 #[tokio::main]
 pub(crate) async fn serve(config: Config) {
+    let factory = Arc::new(config.coordinator_factory());
+
+    let (cache_crates_task, cache_crates_tx) =
+        CacheTx::spawn(|rx| cache_crates_task(factory.clone(), rx));
+    let (cache_versions_task, cache_versions_tx) =
+        CacheTx::spawn(|rx| cache_versions_task(factory.clone(), rx));
+
+    let factory = Factory(factory);
+
+    let request_db = config.request_database();
+    let (db_task, db_handle) = request_db.spawn();
+
     let root_files = static_file_service(config.root_path(), MAX_AGE_ONE_DAY);
     let asset_files = static_file_service(config.asset_path(), MAX_AGE_ONE_YEAR);
     let rewrite_help_as_index = middleware::from_fn(rewrite_help_as_index);
@@ -82,40 +101,28 @@ pub(crate) async fn serve(config: Config) {
         .route(&transform("/macro-expansion"), post(macro_expansion))
         .route(&transform("/meta/crates"), get_or_post(meta_crates))
         .route(
-            &transform("/meta/version/stable"),
-            get_or_post(meta_version_stable),
-        )
-        .route(
-            &transform("/meta/version/beta"),
-            get_or_post(meta_version_beta),
-        )
-        .route(
-            &transform("/meta/version/nightly"),
-            get_or_post(meta_version_nightly),
-        )
-        .route(
-            &transform("/meta/version/rustfmt"),
-            get_or_post(meta_version_rustfmt),
-        )
-        .route(
-            &transform("/meta/version/clippy"),
-            get_or_post(meta_version_clippy),
-        )
-        .route(
-            &transform("/meta/version/miri"),
-            get_or_post(meta_version_miri),
+            &transform("/meta/versions"),
+            get_or_post(meta_versions),
         )
         .route(&transform("/meta/gist"), post(meta_gist_create))
         .route(&transform("/meta/gist/"), post(meta_gist_create)) // compatibility with lax frontend code
-        .route(&transform("/meta/gist/:id"), get(meta_gist_get))
+        .route(&transform("/meta/gist/{id}"), get(meta_gist_get))
         .route(&transform("/metrics"), get(metrics))
         .route(&transform("/websocket"), get(websocket))
         .route(&transform("/nowebsocket"), post(nowebsocket))
-        .route(&transform("/whynowebsocket"), get(whynowebsocket))
+        .route(&transform("/internal/debug/whynowebsocket"), get(whynowebsocket))
+        .route(
+            &transform("/internal/debug/tracked-containers"),
+            get(tracked_containers),
+        )
         .layer(Extension(config.clone()))
-        .layer(Extension(Arc::new(SandboxCache::default())))
+        .layer(Extension(factory))
+        .layer(Extension(db_handle))
+        .layer(Extension(cache_crates_tx))
+        .layer(Extension(cache_versions_tx))
         .layer(Extension(config.github_token()))
-        .layer(Extension(config.feature_flags));
+        .layer(Extension(config.feature_flags))
+        .layer(Extension(config.websocket_config));
 
     if let Some(token) = config.metrics_token() {
         app = app.layer(Extension(token))
@@ -132,13 +139,55 @@ pub(crate) async fn serve(config: Config) {
         });
     }
 
-    // Basic access logging
-    app = app.layer(TraceLayer::new_for_http());
+    let x_request_id = HeaderName::from_static("x-request-id");
 
-    axum::Server::bind(&config.server_socket_addr())
-        .serve(app.into_make_service())
+    // Basic access logging
+    app = app.layer(
+        TraceLayer::new_for_http().make_span_with(move |req: &Request<_>| {
+            const REQUEST_ID: &str = "request_id";
+
+            let method = req.method();
+            let uri = req.uri();
+            let request_id = req
+                .headers()
+                .get(&x_request_id)
+                .and_then(|id| id.to_str().ok());
+
+            let span = error_span!("request", %method, %uri, { REQUEST_ID } = field::Empty);
+
+            if let Some(request_id) = request_id {
+                span.record(REQUEST_ID, field::display(request_id));
+            }
+
+            span
+        }),
+    );
+
+    let x_request_id = HeaderName::from_static("x-request-id");
+
+    // propagate `x-request-id` headers from request to response
+    app = app.layer(PropagateRequestIdLayer::new(x_request_id.clone()));
+
+    app = app.layer(SetRequestIdLayer::new(
+        x_request_id.clone(),
+        MakeRequestUuid::default(),
+    ));
+
+    let server_socket_addr = config.server_socket_addr();
+    tracing::info!("Serving playground backend at http://{server_socket_addr}");
+
+    let listener = tokio::net::TcpListener::bind(server_socket_addr)
         .await
         .unwrap();
+
+    let server = axum::serve(listener, app.into_make_service());
+
+    select! {
+        v = server => v.unwrap(),
+        v = db_task => v.unwrap(),
+        v = cache_crates_task => v.unwrap(),
+        v = cache_versions_task => v.unwrap(),
+    }
 }
 
 fn get_or_post<T: 'static>(handler: impl Handler<T, ()> + Copy) -> MethodRouter {
@@ -153,7 +202,7 @@ fn static_file_service(root: impl AsRef<path::Path>, max_age: HeaderValue) -> Me
     get_service(with_caching)
 }
 
-async fn strip_public_url<B>(mut req: Request<B>, next: middleware::Next<B>) -> impl IntoResponse {
+async fn strip_public_url(mut req: Request<Body>, next: middleware::Next) -> impl IntoResponse {
     let config: &Config = req.extensions().get().unwrap();
     let public_url = config.public_url.clone();
 
@@ -176,9 +225,9 @@ async fn strip_public_url<B>(mut req: Request<B>, next: middleware::Next<B>) -> 
     next.run(req).await
 }
 
-async fn rewrite_help_as_index<B>(
-    mut req: Request<B>,
-    next: middleware::Next<B>,
+async fn rewrite_help_as_index(
+    mut req: Request<Body>,
+    next: middleware::Next,
 ) -> impl IntoResponse {
     let uri = req.uri_mut();
     if uri.path() == "/help" {
@@ -190,98 +239,161 @@ async fn rewrite_help_as_index<B>(
     next.run(req).await
 }
 
+async fn attempt_record_request<T, RFut, RT, RE>(
+    db: Handle,
+    req: T,
+    f: impl FnOnce(T) -> RFut,
+) -> Result<RT, RE>
+where
+    T: HasEndpoint + serde::Serialize,
+    RFut: Future<Output = Result<RT, RE>>,
+{
+    let category = format!("http.{}", <&str>::from(T::ENDPOINT));
+    let payload = serde_json::to_string(&req).unwrap_or_else(|_| String::from("<invalid JSON>"));
+    let guard = db.start_with_guard(category, payload).await;
+
+    let r = f(req).await;
+
+    guard.complete_now(r)
+}
+
 // This is a backwards compatibilty shim. The Rust documentation uses
 // this to run code in place.
-async fn evaluate(Json(req): Json<EvaluateRequest>) -> Result<Json<EvaluateResponse>> {
-    with_coordinator(req, |c, req| c.execute(req).context(EvaluateSnafu).boxed())
+async fn evaluate(
+    Extension(factory): Extension<Factory>,
+    Extension(db): Extension<Handle>,
+    Json(req): Json<api::EvaluateRequest>,
+) -> Result<Json<api::EvaluateResponse>> {
+    attempt_record_request(db, req, |req| async {
+        with_coordinator(&factory.0, req, |c, req| {
+            c.execute(req).context(EvaluateSnafu).boxed()
+        })
         .await
         .map(Json)
-}
-
-async fn compile(Json(req): Json<CompileRequest>) -> Result<Json<CompileResponse>> {
-    with_coordinator(req, |c, req| c.compile(req).context(CompileSnafu).boxed())
-        .await
-        .map(Json)
-}
-
-async fn execute(Json(req): Json<ExecuteRequest>) -> Result<Json<ExecuteResponse>> {
-    with_coordinator(req, |c, req| c.execute(req).context(ExecuteSnafu).boxed())
-        .await
-        .map(Json)
-}
-
-async fn format(Json(req): Json<FormatRequest>) -> Result<Json<FormatResponse>> {
-    with_coordinator(req, |c, req| c.format(req).context(FormatSnafu).boxed())
-        .await
-        .map(Json)
-}
-
-async fn clippy(Json(req): Json<ClippyRequest>) -> Result<Json<ClippyResponse>> {
-    with_coordinator(req, |c, req| c.clippy(req).context(ClippySnafu).boxed())
-        .await
-        .map(Json)
-}
-
-async fn miri(Json(req): Json<MiriRequest>) -> Result<Json<MiriResponse>> {
-    with_sandbox(
-        req,
-        |sb, req| async move { sb.miri(req).await }.boxed(),
-        InterpretingSnafu,
-    )
+    })
     .await
-    .map(Json)
+}
+
+async fn compile(
+    Extension(factory): Extension<Factory>,
+    Extension(db): Extension<Handle>,
+    Json(req): Json<api::CompileRequest>,
+) -> Result<Json<api::CompileResponse>> {
+    attempt_record_request(db, req, |req| async {
+        with_coordinator(&factory.0, req, |c, req| {
+            c.compile(req).context(CompileSnafu).boxed()
+        })
+        .await
+        .map(Json)
+    })
+    .await
+}
+
+async fn execute(
+    Extension(factory): Extension<Factory>,
+    Extension(db): Extension<Handle>,
+    Json(req): Json<api::ExecuteRequest>,
+) -> Result<Json<api::ExecuteResponse>> {
+    attempt_record_request(db, req, |req| async {
+        with_coordinator(&factory.0, req, |c, req| {
+            c.execute(req).context(ExecuteSnafu).boxed()
+        })
+        .await
+        .map(Json)
+    })
+    .await
+}
+
+async fn format(
+    Extension(factory): Extension<Factory>,
+    Extension(db): Extension<Handle>,
+    Json(req): Json<api::FormatRequest>,
+) -> Result<Json<api::FormatResponse>> {
+    attempt_record_request(db, req, |req| async {
+        with_coordinator(&factory.0, req, |c, req| {
+            c.format(req).context(FormatSnafu).boxed()
+        })
+        .await
+        .map(Json)
+    })
+    .await
+}
+
+async fn clippy(
+    Extension(factory): Extension<Factory>,
+    Extension(db): Extension<Handle>,
+    Json(req): Json<api::ClippyRequest>,
+) -> Result<Json<api::ClippyResponse>> {
+    attempt_record_request(db, req, |req| async {
+        with_coordinator(&factory.0, req, |c, req| {
+            c.clippy(req).context(ClippySnafu).boxed()
+        })
+        .await
+        .map(Json)
+    })
+    .await
+}
+
+async fn miri(
+    Extension(factory): Extension<Factory>,
+    Extension(db): Extension<Handle>,
+    Json(req): Json<api::MiriRequest>,
+) -> Result<Json<api::MiriResponse>> {
+    attempt_record_request(db, req, |req| async {
+        with_coordinator(&factory.0, req, |c, req| {
+            c.miri(req).context(MiriSnafu).boxed()
+        })
+        .await
+        .map(Json)
+    })
+    .await
 }
 
 async fn macro_expansion(
-    Json(req): Json<MacroExpansionRequest>,
-) -> Result<Json<MacroExpansionResponse>> {
-    with_sandbox(
-        req,
-        |sb, req| async move { sb.macro_expansion(req).await }.boxed(),
-        ExpansionSnafu,
-    )
-    .await
-    .map(Json)
-}
-
-async fn with_sandbox<F, Req, Resp, SbReq, SbResp, Ctx>(req: Req, f: F, ctx: Ctx) -> Result<Resp>
-where
-    for<'req> F: FnOnce(Sandbox, &'req SbReq) -> BoxFuture<'req, sandbox::Result<SbResp>>,
-    Resp: From<SbResp>,
-    SbReq: TryFrom<Req, Error = Error> + GenerateLabels,
-    SbResp: SuccessDetails,
-    Ctx: IntoError<Error, Source = sandbox::Error>,
-{
-    let sandbox = Sandbox::new().await.context(SandboxCreationSnafu)?;
-    let request = req.try_into()?;
-    track_metric_async(request, |request| f(sandbox, request))
+    Extension(factory): Extension<Factory>,
+    Extension(db): Extension<Handle>,
+    Json(req): Json<api::MacroExpansionRequest>,
+) -> Result<Json<api::MacroExpansionResponse>> {
+    attempt_record_request(db, req, |req| async {
+        with_coordinator(&factory.0, req, |c, req| {
+            c.macro_expansion(req).context(MacroExpansionSnafu).boxed()
+        })
         .await
-        .map(Into::into)
-        .context(ctx)
+        .map(Json)
+    })
+    .await
 }
 
 pub(crate) trait HasEndpoint {
     const ENDPOINT: Endpoint;
 }
 
-impl HasEndpoint for EvaluateRequest {
+impl HasEndpoint for api::EvaluateRequest {
     const ENDPOINT: Endpoint = Endpoint::Evaluate;
 }
 
-impl HasEndpoint for CompileRequest {
+impl HasEndpoint for api::CompileRequest {
     const ENDPOINT: Endpoint = Endpoint::Compile;
 }
 
-impl HasEndpoint for ExecuteRequest {
+impl HasEndpoint for api::ExecuteRequest {
     const ENDPOINT: Endpoint = Endpoint::Execute;
 }
 
-impl HasEndpoint for FormatRequest {
+impl HasEndpoint for api::FormatRequest {
     const ENDPOINT: Endpoint = Endpoint::Format;
 }
 
-impl HasEndpoint for ClippyRequest {
+impl HasEndpoint for api::ClippyRequest {
     const ENDPOINT: Endpoint = Endpoint::Clippy;
+}
+
+impl HasEndpoint for api::MiriRequest {
+    const ENDPOINT: Endpoint = Endpoint::Miri;
+}
+
+impl HasEndpoint for api::MacroExpansionRequest {
+    const ENDPOINT: Endpoint = Endpoint::MacroExpansion;
 }
 
 trait IsSuccess {
@@ -330,6 +442,18 @@ impl IsSuccess for coordinator::ClippyResponse {
     }
 }
 
+impl IsSuccess for coordinator::MiriResponse {
+    fn is_success(&self) -> bool {
+        self.success
+    }
+}
+
+impl IsSuccess for coordinator::MacroExpansionResponse {
+    fn is_success(&self) -> bool {
+        self.success
+    }
+}
+
 impl Outcome {
     fn from_success(other: impl IsSuccess) -> Self {
         if other.is_success() {
@@ -340,7 +464,11 @@ impl Outcome {
     }
 }
 
-async fn with_coordinator<WebReq, WebResp, Req, Resp, F>(req: WebReq, f: F) -> Result<WebResp>
+async fn with_coordinator<WebReq, WebResp, Req, Resp, F>(
+    factory: &CoordinatorFactory,
+    req: WebReq,
+    f: F,
+) -> Result<WebResp>
 where
     WebReq: TryInto<Req>,
     WebReq: HasEndpoint,
@@ -351,7 +479,7 @@ where
     for<'f> F:
         FnOnce(&'f coordinator::Coordinator<DockerBackend>, Req) -> BoxFuture<'f, Result<Resp>>,
 {
-    let coordinator = orchestrator::coordinator::Coordinator::new_docker().await;
+    let coordinator = factory.build();
 
     let job = async {
         let req = req.try_into()?;
@@ -392,70 +520,22 @@ where
 }
 
 async fn meta_crates(
-    Extension(cache): Extension<Arc<SandboxCache>>,
+    Extension(tx): Extension<CacheCratesTx>,
     if_none_match: Option<TypedHeader<IfNoneMatch>>,
 ) -> Result<impl IntoResponse> {
-    // Json<MetaCratesResponse
-    let value = track_metric_no_request_async(Endpoint::MetaCrates, || cache.crates()).await?;
-
+    let value = track_metric_no_request_async(Endpoint::MetaCrates, || tx.get())
+        .await
+        .context(CratesSnafu)?;
     apply_timestamped_caching(value, if_none_match)
 }
 
-async fn meta_version_stable(
-    Extension(cache): Extension<Arc<SandboxCache>>,
+async fn meta_versions(
+    Extension(tx): Extension<CacheVersionsTx>,
     if_none_match: Option<TypedHeader<IfNoneMatch>>,
 ) -> Result<impl IntoResponse> {
-    let value =
-        track_metric_no_request_async(Endpoint::MetaVersionStable, || cache.version_stable())
-            .await?;
-    apply_timestamped_caching(value, if_none_match)
-}
-
-async fn meta_version_beta(
-    Extension(cache): Extension<Arc<SandboxCache>>,
-    if_none_match: Option<TypedHeader<IfNoneMatch>>,
-) -> Result<impl IntoResponse> {
-    let value =
-        track_metric_no_request_async(Endpoint::MetaVersionBeta, || cache.version_beta()).await?;
-    apply_timestamped_caching(value, if_none_match)
-}
-
-async fn meta_version_nightly(
-    Extension(cache): Extension<Arc<SandboxCache>>,
-    if_none_match: Option<TypedHeader<IfNoneMatch>>,
-) -> Result<impl IntoResponse> {
-    let value =
-        track_metric_no_request_async(Endpoint::MetaVersionNightly, || cache.version_nightly())
-            .await?;
-    apply_timestamped_caching(value, if_none_match)
-}
-
-async fn meta_version_rustfmt(
-    Extension(cache): Extension<Arc<SandboxCache>>,
-    if_none_match: Option<TypedHeader<IfNoneMatch>>,
-) -> Result<impl IntoResponse> {
-    let value =
-        track_metric_no_request_async(Endpoint::MetaVersionRustfmt, || cache.version_rustfmt())
-            .await?;
-    apply_timestamped_caching(value, if_none_match)
-}
-
-async fn meta_version_clippy(
-    Extension(cache): Extension<Arc<SandboxCache>>,
-    if_none_match: Option<TypedHeader<IfNoneMatch>>,
-) -> Result<impl IntoResponse> {
-    let value =
-        track_metric_no_request_async(Endpoint::MetaVersionClippy, || cache.version_clippy())
-            .await?;
-    apply_timestamped_caching(value, if_none_match)
-}
-
-async fn meta_version_miri(
-    Extension(cache): Extension<Arc<SandboxCache>>,
-    if_none_match: Option<TypedHeader<IfNoneMatch>>,
-) -> Result<impl IntoResponse> {
-    let value =
-        track_metric_no_request_async(Endpoint::MetaVersionMiri, || cache.version_miri()).await?;
+    let value = track_metric_no_request_async(Endpoint::MetaVersions, || tx.get())
+        .await
+        .context(VersionsSnafu)?;
     apply_timestamped_caching(value, if_none_match)
 }
 
@@ -492,12 +572,19 @@ where
     Ok((etag, cache_control, response))
 }
 
+fn must_get(token: &GhToken) -> Result<String> {
+    token
+        .0
+        .as_ref()
+        .map(|s| String::clone(s))
+        .context(NoGithubTokenSnafu)
+}
+
 async fn meta_gist_create(
     Extension(token): Extension<GhToken>,
-    Json(req): Json<MetaGistCreateRequest>,
-) -> Result<Json<MetaGistResponse>> {
-    let token = token.must_get()?;
-    Ok(Json(MetaGistResponse {
+    Json(req): Json<api::MetaGistCreateRequest>,
+) -> Result<Json<api::MetaGistResponse>> {
+    Ok(Json(api::MetaGistResponse {
         id: String::new(),
         url: String::new(),
         code: req.code,
@@ -507,8 +594,8 @@ async fn meta_gist_create(
 async fn meta_gist_get(
     Extension(token): Extension<GhToken>,
     Path(id): Path<String>,
-) -> Result<Json<MetaGistResponse>> {
-    let token = token.must_get()?;
+) -> Result<Json<api::MetaGistResponse>> {
+    let token = must_get(&token)?;
     gist::load_future(token, &id)
         .await
         .map(Into::into)
@@ -516,7 +603,7 @@ async fn meta_gist_get(
         .context(GistLoadingSnafu)
 }
 
-async fn metrics(_: MetricsAuthorization) -> Result<Vec<u8>, StatusCode> {
+async fn metrics(_: MetricsAuthorization) -> Result<impl IntoResponse, StatusCode> {
     use prometheus::{Encoder, TextEncoder};
 
     let metric_families = prometheus::gather();
@@ -525,15 +612,26 @@ async fn metrics(_: MetricsAuthorization) -> Result<Vec<u8>, StatusCode> {
 
     encoder
         .encode(&metric_families, &mut buffer)
-        .map(|_| buffer)
+        .map(|_| {
+            (
+                [(
+                    header::CONTENT_TYPE,
+                    "text/plain; version=0.0.4; charset=utf-8",
+                )],
+                buffer,
+            )
+        })
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 async fn websocket(
     ws: WebSocketUpgrade,
+    Extension(config): Extension<WebSocketConfig>,
+    Extension(factory): Extension<Factory>,
     Extension(feature_flags): Extension<crate::FeatureFlags>,
+    Extension(db): Extension<Handle>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |s| websocket::handle(s, feature_flags.into()))
+    ws.on_upgrade(move |s| websocket::handle(s, config, factory.0, feature_flags.into(), db))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -548,9 +646,8 @@ async fn nowebsocket(Json(req): Json<NoWebSocketRequest>) {
     UNAVAILABLE_WS.inc();
 }
 
-lazy_static::lazy_static! {
-    static ref WS_ERRORS: std::sync::Mutex<std::collections::HashMap<String, usize>> = Default::default();
-}
+static WS_ERRORS: LazyLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+    LazyLock::new(|| Default::default());
 
 fn record_websocket_error(error: String) {
     *WS_ERRORS
@@ -564,6 +661,16 @@ async fn whynowebsocket() -> String {
     format!("{:#?}", WS_ERRORS.lock().unwrap_or_else(|e| e.into_inner()))
 }
 
+async fn tracked_containers() -> String {
+    let tracked_containers = TRACKED_CONTAINERS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    tracked_containers
+        .iter()
+        .fold(String::new(), |a, s| a + s + "\n")
+}
+
 #[derive(Debug)]
 struct MetricsAuthorization;
 
@@ -573,7 +680,67 @@ impl MetricsAuthorization {
     const FAILURE: MetricsAuthorizationRejection = (StatusCode::UNAUTHORIZED, "Wrong credentials");
 }
 
-#[async_trait]
+type CacheCratesTx = CacheTx<api::MetaCratesResponse, CacheCratesError>;
+type CacheCratesItem = CacheTaskItem<api::MetaCratesResponse, CacheCratesError>;
+
+#[tracing::instrument(skip_all)]
+async fn cache_crates_task(factory: Arc<CoordinatorFactory>, rx: mpsc::Receiver<CacheCratesItem>) {
+    cache_task(rx, move || {
+        let coordinator = factory.build::<DockerBackend>();
+
+        async move {
+            let crates = coordinator.crates().map_ok(From::from).await?;
+
+            coordinator.shutdown().await?;
+
+            Ok::<_, CacheCratesError>(crates)
+        }
+        .boxed()
+    })
+    .await
+}
+
+#[derive(Debug, Snafu)]
+enum CacheCratesError {
+    #[snafu(transparent)]
+    Crates { source: coordinator::CratesError },
+
+    #[snafu(transparent)]
+    Shutdown { source: coordinator::Error },
+}
+
+type CacheVersionsTx = CacheTx<api::MetaVersionsResponse, CacheVersionsError>;
+type CacheVersionsItem = CacheTaskItem<api::MetaVersionsResponse, CacheVersionsError>;
+
+#[tracing::instrument(skip_all)]
+async fn cache_versions_task(
+    factory: Arc<CoordinatorFactory>,
+    rx: mpsc::Receiver<CacheVersionsItem>,
+) {
+    cache_task(rx, move || {
+        let coordinator = factory.build::<DockerBackend>();
+
+        async move {
+            let versions = coordinator.versions().map_ok(From::from).await?;
+
+            coordinator.shutdown().await?;
+
+            Ok::<_, CacheVersionsError>(versions)
+        }
+        .boxed()
+    })
+    .await
+}
+
+#[derive(Debug, Snafu)]
+enum CacheVersionsError {
+    #[snafu(transparent)]
+    Versions { source: coordinator::VersionsError },
+
+    #[snafu(transparent)]
+    Shutdown { source: coordinator::Error },
+}
+
 impl<S> extract::FromRequestParts<S> for MetricsAuthorization
 where
     S: Send + Sync,
@@ -600,188 +767,16 @@ where
     }
 }
 
-type Stamped<T> = (T, SystemTime);
-
-#[derive(Debug, Default)]
-struct SandboxCache {
-    crates: CacheOne<MetaCratesResponse>,
-    version_stable: CacheOne<MetaVersionResponse>,
-    version_beta: CacheOne<MetaVersionResponse>,
-    version_nightly: CacheOne<MetaVersionResponse>,
-    version_rustfmt: CacheOne<MetaVersionResponse>,
-    version_clippy: CacheOne<MetaVersionResponse>,
-    version_miri: CacheOne<MetaVersionResponse>,
-}
-
-impl SandboxCache {
-    async fn crates(&self) -> Result<Stamped<MetaCratesResponse>> {
-        self.crates
-            .fetch(
-                |sandbox| async move { Ok(sandbox.crates().await.context(CachingSnafu)?.into()) },
-            )
-            .await
-    }
-
-    async fn version_stable(&self) -> Result<Stamped<MetaVersionResponse>> {
-        self.version_stable
-            .fetch(|sandbox| async move {
-                let version = sandbox
-                    .version(Channel::Stable)
-                    .await
-                    .context(CachingSnafu)?;
-                Ok(version.into())
-            })
-            .await
-    }
-
-    async fn version_beta(&self) -> Result<Stamped<MetaVersionResponse>> {
-        self.version_beta
-            .fetch(|sandbox| async move {
-                let version = sandbox.version(Channel::Beta).await.context(CachingSnafu)?;
-                Ok(version.into())
-            })
-            .await
-    }
-
-    async fn version_nightly(&self) -> Result<Stamped<MetaVersionResponse>> {
-        self.version_nightly
-            .fetch(|sandbox| async move {
-                let version = sandbox
-                    .version(Channel::Nightly)
-                    .await
-                    .context(CachingSnafu)?;
-                Ok(version.into())
-            })
-            .await
-    }
-
-    async fn version_rustfmt(&self) -> Result<Stamped<MetaVersionResponse>> {
-        self.version_rustfmt
-            .fetch(|sandbox| async move {
-                Ok(sandbox
-                    .version_rustfmt()
-                    .await
-                    .context(CachingSnafu)?
-                    .into())
-            })
-            .await
-    }
-
-    async fn version_clippy(&self) -> Result<Stamped<MetaVersionResponse>> {
-        self.version_clippy
-            .fetch(|sandbox| async move {
-                Ok(sandbox.version_clippy().await.context(CachingSnafu)?.into())
-            })
-            .await
-    }
-
-    async fn version_miri(&self) -> Result<Stamped<MetaVersionResponse>> {
-        self.version_miri
-            .fetch(|sandbox| async move {
-                Ok(sandbox.version_miri().await.context(CachingSnafu)?.into())
-            })
-            .await
-    }
-}
-
-#[derive(Debug)]
-struct CacheOne<T>(Mutex<Option<CacheInfo<T>>>);
-
-impl<T> Default for CacheOne<T> {
-    fn default() -> Self {
-        Self(Default::default())
-    }
-}
-
-impl<T> CacheOne<T>
-where
-    T: Clone + PartialEq,
-{
-    async fn fetch<F, FFut>(&self, generator: F) -> Result<Stamped<T>>
-    where
-        F: FnOnce(Sandbox) -> FFut,
-        FFut: Future<Output = Result<T>>,
-    {
-        let data = &mut *self.0.lock().await;
-        match data {
-            Some(info) => {
-                if info.validation_time.elapsed() <= SANDBOX_CACHE_TIME_TO_LIVE {
-                    Ok(info.stamped_value())
-                } else {
-                    Self::set_value(data, generator).await
-                }
-            }
-            None => Self::set_value(data, generator).await,
-        }
-    }
-
-    async fn set_value<F, FFut>(data: &mut Option<CacheInfo<T>>, generator: F) -> Result<Stamped<T>>
-    where
-        F: FnOnce(Sandbox) -> FFut,
-        FFut: Future<Output = Result<T>>,
-    {
-        let sandbox = Sandbox::new().await.context(SandboxCreationSnafu)?;
-        let value = generator(sandbox).await?;
-
-        let old_info = data.take();
-        let new_info = CacheInfo::build(value);
-
-        let info = match old_info {
-            Some(mut old_value) => {
-                if old_value.value == new_info.value {
-                    // The value hasn't changed; record that we have
-                    // checked recently, but keep the creation time to
-                    // preserve caching.
-                    old_value.validation_time = new_info.validation_time;
-                    old_value
-                } else {
-                    new_info
-                }
-            }
-            None => new_info,
-        };
-
-        let value = info.stamped_value();
-
-        *data = Some(info);
-
-        Ok(value)
-    }
-}
-
-#[derive(Debug)]
-struct CacheInfo<T> {
-    value: T,
-    creation_time: SystemTime,
-    validation_time: Instant,
-}
-
-impl<T> CacheInfo<T> {
-    fn build(value: T) -> Self {
-        let creation_time = SystemTime::now();
-        let validation_time = Instant::now();
-
-        Self {
-            value,
-            creation_time,
-            validation_time,
-        }
-    }
-
-    fn stamped_value(&self) -> Stamped<T>
-    where
-        T: Clone,
-    {
-        (self.value.clone(), self.creation_time)
-    }
-}
-
 impl IntoResponse for Error {
     fn into_response(self) -> axum::response::Response {
-        Json(ErrorJson {
-            error: self.to_string(),
-        })
-        .into_response()
+        let error = snafu::CleanedErrorText::new(&self)
+            .map(|(_, s, _)| s)
+            .reduce(|l, r| l + ": " + &r)
+            .unwrap_or_default();
+        error!(error, "Returning an error to the client");
+        let resp = Json(api::ErrorJson { error });
+        let resp = (StatusCode::INTERNAL_SERVER_ERROR, resp);
+        resp.into_response()
     }
 }
 
@@ -789,23 +784,21 @@ impl IntoResponse for Error {
 /// error and format it using our expected JSON error object.
 struct Json<T>(T);
 
-#[async_trait]
-impl<T, S, B> extract::FromRequest<S, B> for Json<T>
+impl<T, S> extract::FromRequest<S> for Json<T>
 where
     T: serde::de::DeserializeOwned,
     S: Send + Sync,
-    B: axum::body::HttpBody + Send + 'static,
-    B::Data: Send,
-    B::Error: Into<axum::BoxError>,
 {
     type Rejection = axum::response::Response;
 
-    async fn from_request(req: Request<B>, state: &S) -> Result<Self, Self::Rejection> {
+    async fn from_request(req: Request<Body>, state: &S) -> Result<Self, Self::Rejection> {
         match axum::Json::<T>::from_request(req, state).await {
             Ok(v) => Ok(Self(v.0)),
             Err(e) => {
                 let error = format!("Unable to deserialize request: {e}");
-                Err(axum::Json(ErrorJson { error }).into_response())
+                let resp = axum::Json(api::ErrorJson { error });
+                let resp = (StatusCode::BAD_REQUEST, resp);
+                Err(resp.into_response())
             }
         }
     }
@@ -820,16 +813,179 @@ where
     }
 }
 
+#[derive(Debug, Snafu)]
+enum Error {
+    #[snafu(display("Gist creation failed"))]
+    GistCreation { source: octocrab::Error },
+
+    #[snafu(display("Gist loading failed"))]
+    GistLoading { source: octocrab::Error },
+
+    #[snafu(display("{PLAYGROUND_GITHUB_TOKEN} not set up for reading/writing gists"))]
+    NoGithubToken,
+
+    #[snafu(transparent)]
+    EvaluateRequest {
+        source: api_orchestrator_integration_impls::ParseEvaluateRequestError,
+    },
+
+    #[snafu(transparent)]
+    CompileRequest {
+        source: api_orchestrator_integration_impls::ParseCompileRequestError,
+    },
+
+    #[snafu(transparent)]
+    ExecuteRequest {
+        source: api_orchestrator_integration_impls::ParseExecuteRequestError,
+    },
+
+    #[snafu(transparent)]
+    FormatRequest {
+        source: api_orchestrator_integration_impls::ParseFormatRequestError,
+    },
+
+    #[snafu(transparent)]
+    ClippyRequest {
+        source: api_orchestrator_integration_impls::ParseClippyRequestError,
+    },
+
+    #[snafu(transparent)]
+    MiriRequest {
+        source: api_orchestrator_integration_impls::ParseMiriRequestError,
+    },
+
+    #[snafu(transparent)]
+    MacroExpansionRequest {
+        source: api_orchestrator_integration_impls::ParseMacroExpansionRequestError,
+    },
+
+    #[snafu(display("Unable to find the available crates"))]
+    Crates {
+        source: CacheTxError<CacheCratesError>,
+    },
+
+    #[snafu(display("Unable to find the available versions"))]
+    Versions {
+        source: CacheTxError<CacheVersionsError>,
+    },
+
+    #[snafu(display("Unable to shutdown the coordinator"))]
+    ShutdownCoordinator {
+        source: orchestrator::coordinator::Error,
+    },
+
+    #[snafu(display("Unable to process the evaluate request"))]
+    Evaluate {
+        source: orchestrator::coordinator::ExecuteError,
+    },
+
+    #[snafu(display("Unable to process the compile request"))]
+    Compile {
+        source: orchestrator::coordinator::CompileError,
+    },
+
+    #[snafu(display("Unable to process the execute request"))]
+    Execute {
+        source: orchestrator::coordinator::ExecuteError,
+    },
+
+    #[snafu(display("Unable to process the format request"))]
+    Format {
+        source: orchestrator::coordinator::FormatError,
+    },
+
+    #[snafu(display("Unable to process the Clippy request"))]
+    Clippy {
+        source: orchestrator::coordinator::ClippyError,
+    },
+
+    #[snafu(display("Unable to process the Miri request"))]
+    Miri {
+        source: orchestrator::coordinator::MiriError,
+    },
+
+    #[snafu(display("Unable to process the macro expansion request"))]
+    MacroExpansion {
+        source: orchestrator::coordinator::MacroExpansionError,
+    },
+
+    #[snafu(display("The operation timed out"))]
+    Timeout { source: tokio::time::error::Elapsed },
+}
+
+type Result<T, E = Error> = ::std::result::Result<T, E>;
+
 pub(crate) mod api_orchestrator_integration_impls {
     use orchestrator::coordinator::*;
     use snafu::prelude::*;
     use std::convert::TryFrom;
 
-    impl TryFrom<crate::EvaluateRequest> for ExecuteRequest {
+    use crate::gist;
+    use crate::public_http_api as api;
+
+    impl From<Vec<Crate>> for api::MetaCratesResponse {
+        fn from(other: Vec<Crate>) -> Self {
+            let crates = other
+                .into_iter()
+                .map(|c| {
+                    let Crate { name, version, id } = c;
+                    api::CrateInformation { name, version, id }
+                })
+                .collect();
+            Self { crates }
+        }
+    }
+
+    impl From<Versions> for api::MetaVersionsResponse {
+        fn from(other: Versions) -> Self {
+            let Versions {
+                stable,
+                beta,
+                nightly,
+            } = other;
+            let [stable, beta, nightly] = [stable, beta, nightly].map(Into::into);
+            Self {
+                stable,
+                beta,
+                nightly,
+            }
+        }
+    }
+
+    impl From<ChannelVersions> for api::MetaChannelVersionResponse {
+        fn from(other: ChannelVersions) -> Self {
+            let ChannelVersions {
+                rustc,
+                rustfmt,
+                clippy,
+                miri,
+            } = other;
+            let [rustc, rustfmt, clippy] = [rustc, rustfmt, clippy].map(|v| (&v).into());
+            let miri = miri.map(|v| (&v).into());
+            Self {
+                rustc,
+                rustfmt,
+                clippy,
+                miri,
+            }
+        }
+    }
+
+    impl From<&Version> for api::MetaVersionResponse {
+        fn from(other: &Version) -> Self {
+            Self {
+                version: (&*other.release).into(),
+                hash: (&*other.commit_hash).into(),
+                date: (&*other.commit_date).into(),
+            }
+        }
+    }
+
+    impl TryFrom<api::EvaluateRequest> for ExecuteRequest {
         type Error = ParseEvaluateRequestError;
 
-        fn try_from(other: crate::EvaluateRequest) -> Result<Self, Self::Error> {
-            let crate::EvaluateRequest {
+        fn try_from(other: api::EvaluateRequest) -> Result<Self, Self::Error> {
+            let api::EvaluateRequest {
                 version,
                 optimize,
                 code,
@@ -863,14 +1019,14 @@ pub(crate) mod api_orchestrator_integration_impls {
 
     #[derive(Debug, Snafu)]
     pub(crate) enum ParseEvaluateRequestError {
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         Channel { source: ParseChannelError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         Edition { source: ParseEditionError },
     }
 
-    impl From<WithOutput<ExecuteResponse>> for crate::EvaluateResponse {
+    impl From<WithOutput<ExecuteResponse>> for api::EvaluateResponse {
         fn from(other: WithOutput<ExecuteResponse>) -> Self {
             let WithOutput {
                 response,
@@ -884,7 +1040,7 @@ pub(crate) mod api_orchestrator_integration_impls {
             // the page, don't include the stderr unless an error
             // occurred.
             if response.success {
-                crate::EvaluateResponse {
+                api::EvaluateResponse {
                     result: stdout,
                     error: None,
                 }
@@ -894,7 +1050,7 @@ pub(crate) mod api_orchestrator_integration_impls {
                 // the `result` field and then they string search for
                 // `error:` or `warning:`. Ew. We can put it in both.
                 let result = stderr + &stdout;
-                crate::EvaluateResponse {
+                api::EvaluateResponse {
                     result: result.clone(),
                     error: Some(result),
                 }
@@ -902,11 +1058,11 @@ pub(crate) mod api_orchestrator_integration_impls {
         }
     }
 
-    impl TryFrom<crate::CompileRequest> for CompileRequest {
+    impl TryFrom<api::CompileRequest> for CompileRequest {
         type Error = ParseCompileRequestError;
 
-        fn try_from(other: crate::CompileRequest) -> Result<Self, Self::Error> {
-            let crate::CompileRequest {
+        fn try_from(other: api::CompileRequest) -> Result<Self, Self::Error> {
+            let api::CompileRequest {
                 target,
                 assembly_flavor,
                 demangle_assembly,
@@ -940,23 +1096,23 @@ pub(crate) mod api_orchestrator_integration_impls {
 
     #[derive(Debug, Snafu)]
     pub(crate) enum ParseCompileRequestError {
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         Target { source: ParseCompileTargetError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         Channel { source: ParseChannelError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         CrateType { source: ParseCrateTypeError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         Mode { source: ParseModeError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         Edition { source: ParseEditionError },
     }
 
-    impl From<WithOutput<CompileResponse>> for crate::CompileResponse {
+    impl From<WithOutput<CompileResponse>> for api::CompileResponse {
         fn from(other: WithOutput<CompileResponse>) -> Self {
             let WithOutput {
                 response,
@@ -979,11 +1135,11 @@ pub(crate) mod api_orchestrator_integration_impls {
         }
     }
 
-    impl TryFrom<crate::ExecuteRequest> for ExecuteRequest {
+    impl TryFrom<api::ExecuteRequest> for ExecuteRequest {
         type Error = ParseExecuteRequestError;
 
-        fn try_from(other: crate::ExecuteRequest) -> Result<Self, Self::Error> {
-            let crate::ExecuteRequest {
+        fn try_from(other: api::ExecuteRequest) -> Result<Self, Self::Error> {
+            let api::ExecuteRequest {
                 channel,
                 mode,
                 edition,
@@ -1007,20 +1163,20 @@ pub(crate) mod api_orchestrator_integration_impls {
 
     #[derive(Debug, Snafu)]
     pub(crate) enum ParseExecuteRequestError {
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         Channel { source: ParseChannelError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         CrateType { source: ParseCrateTypeError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         Mode { source: ParseModeError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         Edition { source: ParseEditionError },
     }
 
-    impl From<WithOutput<ExecuteResponse>> for crate::ExecuteResponse {
+    impl From<WithOutput<ExecuteResponse>> for api::ExecuteResponse {
         fn from(other: WithOutput<ExecuteResponse>) -> Self {
             let WithOutput {
                 response,
@@ -1041,14 +1197,23 @@ pub(crate) mod api_orchestrator_integration_impls {
         }
     }
 
-    impl TryFrom<crate::FormatRequest> for FormatRequest {
+    impl TryFrom<api::FormatRequest> for FormatRequest {
         type Error = ParseFormatRequestError;
 
-        fn try_from(other: crate::FormatRequest) -> std::result::Result<Self, Self::Error> {
-            let crate::FormatRequest { code, edition } = other;
+        fn try_from(other: api::FormatRequest) -> std::result::Result<Self, Self::Error> {
+            let api::FormatRequest {
+                channel,
+                edition,
+                code,
+            } = other;
+
+            let channel = match channel {
+                Some(c) => parse_channel(&c)?,
+                None => Channel::Nightly,
+            };
 
             Ok(FormatRequest {
-                channel: Channel::Nightly,     // TODO: use what user has submitted
+                channel,
                 crate_type: CrateType::Binary, // TODO: use what user has submitted
                 edition: parse_edition(&edition)?,
                 code,
@@ -1058,11 +1223,14 @@ pub(crate) mod api_orchestrator_integration_impls {
 
     #[derive(Debug, Snafu)]
     pub(crate) enum ParseFormatRequestError {
-        #[snafu(context(false))]
+        #[snafu(transparent)]
+        Channel { source: ParseChannelError },
+
+        #[snafu(transparent)]
         Edition { source: ParseEditionError },
     }
 
-    impl From<WithOutput<FormatResponse>> for crate::FormatResponse {
+    impl From<WithOutput<FormatResponse>> for api::FormatResponse {
         fn from(other: WithOutput<FormatResponse>) -> Self {
             let WithOutput {
                 response,
@@ -1085,18 +1253,24 @@ pub(crate) mod api_orchestrator_integration_impls {
         }
     }
 
-    impl TryFrom<crate::ClippyRequest> for ClippyRequest {
+    impl TryFrom<api::ClippyRequest> for ClippyRequest {
         type Error = ParseClippyRequestError;
 
-        fn try_from(other: crate::ClippyRequest) -> std::result::Result<Self, Self::Error> {
-            let crate::ClippyRequest {
-                code,
-                edition,
+        fn try_from(other: api::ClippyRequest) -> std::result::Result<Self, Self::Error> {
+            let api::ClippyRequest {
+                channel,
                 crate_type,
+                edition,
+                code,
             } = other;
 
+            let channel = match channel {
+                Some(c) => parse_channel(&c)?,
+                None => Channel::Nightly,
+            };
+
             Ok(ClippyRequest {
-                channel: Channel::Nightly, // TODO: use what user has submitted
+                channel,
                 crate_type: parse_crate_type(&crate_type)?,
                 edition: parse_edition(&edition)?,
                 code,
@@ -1106,14 +1280,17 @@ pub(crate) mod api_orchestrator_integration_impls {
 
     #[derive(Debug, Snafu)]
     pub(crate) enum ParseClippyRequestError {
-        #[snafu(context(false))]
-        Edition { source: ParseEditionError },
+        #[snafu(transparent)]
+        Channel { source: ParseChannelError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         CrateType { source: ParseCrateTypeError },
+
+        #[snafu(transparent)]
+        Edition { source: ParseEditionError },
     }
 
-    impl From<WithOutput<ClippyResponse>> for crate::ClippyResponse {
+    impl From<WithOutput<ClippyResponse>> for api::ClippyResponse {
         fn from(other: WithOutput<ClippyResponse>) -> Self {
             let WithOutput {
                 response,
@@ -1121,6 +1298,104 @@ pub(crate) mod api_orchestrator_integration_impls {
                 stderr,
             } = other;
             let ClippyResponse {
+                success,
+                exit_detail,
+            } = response;
+
+            Self {
+                success,
+                exit_detail,
+                stdout,
+                stderr,
+            }
+        }
+    }
+
+    impl TryFrom<api::MiriRequest> for MiriRequest {
+        type Error = ParseMiriRequestError;
+
+        fn try_from(other: api::MiriRequest) -> std::result::Result<Self, Self::Error> {
+            let api::MiriRequest {
+                code,
+                edition,
+                tests,
+                aliasing_model,
+            } = other;
+
+            let aliasing_model = match aliasing_model {
+                Some(am) => parse_aliasing_model(&am)?,
+                None => AliasingModel::Stacked,
+            };
+
+            Ok(MiriRequest {
+                channel: Channel::Nightly,     // TODO: use what user has submitted
+                crate_type: CrateType::Binary, // TODO: use what user has submitted
+                edition: parse_edition(&edition)?,
+                tests,
+                aliasing_model,
+                code,
+            })
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    pub(crate) enum ParseMiriRequestError {
+        #[snafu(transparent)]
+        Edition { source: ParseEditionError },
+        #[snafu(transparent)]
+        AliasingMode { source: ParseAliasingModelError },
+    }
+
+    impl From<WithOutput<MiriResponse>> for api::MiriResponse {
+        fn from(other: WithOutput<MiriResponse>) -> Self {
+            let WithOutput {
+                response,
+                stdout,
+                stderr,
+            } = other;
+            let MiriResponse {
+                success,
+                exit_detail,
+            } = response;
+
+            Self {
+                success,
+                exit_detail,
+                stdout,
+                stderr,
+            }
+        }
+    }
+
+    impl TryFrom<api::MacroExpansionRequest> for MacroExpansionRequest {
+        type Error = ParseMacroExpansionRequestError;
+
+        fn try_from(other: api::MacroExpansionRequest) -> std::result::Result<Self, Self::Error> {
+            let api::MacroExpansionRequest { code, edition } = other;
+
+            Ok(MacroExpansionRequest {
+                channel: Channel::Nightly,     // TODO: use what user has submitted
+                crate_type: CrateType::Binary, // TODO: use what user has submitted
+                edition: parse_edition(&edition)?,
+                code,
+            })
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    pub(crate) enum ParseMacroExpansionRequestError {
+        #[snafu(transparent)]
+        Edition { source: ParseEditionError },
+    }
+
+    impl From<WithOutput<MacroExpansionResponse>> for api::MacroExpansionResponse {
+        fn from(other: WithOutput<MacroExpansionResponse>) -> Self {
+            let WithOutput {
+                response,
+                stdout,
+                stderr,
+            } = other;
+            let MacroExpansionResponse {
                 success,
                 exit_detail,
             } = response;
@@ -1169,13 +1444,13 @@ pub(crate) mod api_orchestrator_integration_impls {
 
     #[derive(Debug, Snafu)]
     pub(crate) enum ParseCompileTargetError {
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         AssemblyFlavor { source: ParseAssemblyFlavorError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         DemangleAssembly { source: ParseDemangleAssemblyError },
 
-        #[snafu(context(false))]
+        #[snafu(transparent)]
         ProcessAssembly { source: ParseProcessAssemblyError },
 
         #[snafu(display("'{value}' is not a valid target"))]
@@ -1288,5 +1563,29 @@ pub(crate) mod api_orchestrator_integration_impls {
     #[snafu(display("'{value}' is not a valid edition"))]
     pub(crate) struct ParseEditionError {
         value: String,
+    }
+
+    pub(crate) fn parse_aliasing_model(s: &str) -> Result<AliasingModel, ParseAliasingModelError> {
+        Ok(match s {
+            "stacked" => AliasingModel::Stacked,
+            "tree" => AliasingModel::Tree,
+            value => return ParseAliasingModelSnafu { value }.fail(),
+        })
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("'{value}' is not a valid aliasing model"))]
+    pub(crate) struct ParseAliasingModelError {
+        value: String,
+    }
+
+    impl From<gist::Gist> for api::MetaGistResponse {
+        fn from(me: gist::Gist) -> Self {
+            api::MetaGistResponse {
+                id: me.id,
+                url: me.url,
+                code: me.code,
+            }
+        }
     }
 }

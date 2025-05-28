@@ -1,41 +1,57 @@
-import { merge } from 'lodash-es';
-import { useDispatch } from 'react-redux';
 import { configureStore as reduxConfigureStore } from '@reduxjs/toolkit';
 import { produce } from 'immer';
-import type {} from 'redux-thunk/extend-redux';
+import { merge } from 'lodash-es';
 
-import { initializeApplication } from './actions';
 import initializeLocalStorage from './local_storage';
+import { observer } from './observer';
+import reducer from './reducers';
 import initializeSessionStorage from './session_storage';
 import { websocketMiddleware } from './websocketMiddleware';
-import reducer from './reducers';
+
+const editorDarkThemes = {
+  configuration: {
+    ace: {
+      theme: 'github_dark',
+    },
+    monaco: {
+      theme: 'vs-dark',
+    },
+  },
+};
 
 export default function configureStore(window: Window) {
   const baseUrl = new URL(process.env.PUBLIC_URL || '/', window.location.href).href;
   const websocket = websocketMiddleware(window);
+
+  const prefersDarkTheme = window.matchMedia('(prefers-color-scheme: dark)').matches;
+  const initialThemes = prefersDarkTheme ? editorDarkThemes : {};
 
   const initialGlobalState = {
     globalConfiguration: {
       baseUrl,
     },
   };
-  const initialAppState = reducer(undefined, initializeApplication());
+  const initialAppState = reducer(undefined, { type: 'initializeForStore' });
 
   const localStorage = initializeLocalStorage();
   const sessionStorage = initializeSessionStorage();
 
-  const preloadedState = produce(initialAppState, (initialAppState) => merge(
-    initialAppState,
-    initialGlobalState,
-    localStorage.initialState,
-    sessionStorage.initialState,
-  ));
+  const preloadedState = produce(initialAppState, (initialAppState) =>
+    merge(
+      initialAppState,
+      initialGlobalState,
+      initialThemes,
+      localStorage.initialState,
+      sessionStorage.initialState,
+    ),
+  );
 
   const store = reduxConfigureStore({
     reducer,
     preloadedState,
-    middleware: (getDefaultMiddleware) => getDefaultMiddleware().concat(websocket),
-  })
+    middleware: (getDefaultMiddleware) =>
+      getDefaultMiddleware().concat(websocket).prepend(observer.middleware),
+  });
 
   store.subscribe(() => {
     const state = store.getState();
@@ -51,10 +67,9 @@ export default function configureStore(window: Window) {
       localStorage.saveChanges(state);
       sessionStorage.saveChanges(state);
     }
-  })
+  });
 
   return store;
 }
 
 export type AppDispatch = ReturnType<typeof configureStore>['dispatch'];
-export const useAppDispatch = () => useDispatch<AppDispatch>()

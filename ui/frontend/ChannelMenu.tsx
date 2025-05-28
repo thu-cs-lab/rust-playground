@@ -1,31 +1,30 @@
 import React, { Fragment, useCallback } from 'react';
-import { useSelector, useDispatch } from 'react-redux';
 
 import MenuGroup from './MenuGroup';
 import SelectOne from './SelectOne';
 
-import * as actions from './actions';
+import * as config from './reducers/configuration';
 import * as selectors from './selectors';
-import State from './state';
 import { Channel } from './types';
+import { useAppDispatch, useAppSelector } from './hooks';
 
-import styles from './ChannelMenu.module.css';
+import * as styles from './ChannelMenu.module.css';
 
 interface ChannelMenuProps {
   close: () => void;
 }
 
 const ChannelMenu: React.FC<ChannelMenuProps> = props => {
-  const channel = useSelector((state: State) => state.configuration.channel);
-  const stableVersion = useSelector(selectors.stableVersionText);
-  const betaVersion = useSelector(selectors.betaVersionText);
-  const nightlyVersion = useSelector(selectors.nightlyVersionText);
-  const betaVersionDetails = useSelector(selectors.betaVersionDetailsText);
-  const nightlyVersionDetails = useSelector(selectors.nightlyVersionDetailsText);
+  const channel = useAppSelector((state) => state.configuration.channel);
+  const stableVersion = useAppSelector(selectors.stableVersionText);
+  const betaVersion = useAppSelector(selectors.betaVersionText);
+  const nightlyVersion = useAppSelector(selectors.nightlyVersionText);
+  const betaVersionDetails = useAppSelector(selectors.betaVersionDetailsText);
+  const nightlyVersionDetails = useAppSelector(selectors.nightlyVersionDetailsText);
 
-  const dispatch = useDispatch();
+  const dispatch = useAppDispatch();
   const changeChannel = useCallback((channel: Channel) => {
-    dispatch(actions.changeChannel(channel));
+    dispatch(config.changeChannel(channel));
     props.close();
   }, [dispatch, props]);
 

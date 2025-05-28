@@ -1,17 +1,24 @@
-import { AnyAction, Draft, createAsyncThunk, createSlice } from '@reduxjs/toolkit';
+import { Draft, UnknownAction, createAsyncThunk, createSlice } from '@reduxjs/toolkit';
 import * as z from 'zod';
 
-import { SimpleThunkAction, adaptFetchError, jsonPost, routes } from '../../actions';
-import { executeRequestPayloadSelector, executeViaWebsocketSelector } from '../../selectors';
+import { ThunkAction } from '../../actions';
+import { jsonPost, routes } from '../../api';
+import {
+  currentExecutionSequenceNumberSelector,
+  executeRequestPayloadSelector,
+  executeViaWebsocketSelector,
+} from '../../selectors';
 import { Channel, Edition, Mode } from '../../types';
 import {
   WsPayloadAction,
   createWebsocketResponse,
   makeWebSocketMeta,
 } from '../../websocketActions';
+import { websocketError } from '../websocket';
 
 const initialState: State = {
   requestsInProgress: 0,
+  allowLongRun: false,
 };
 
 interface State {
@@ -20,6 +27,9 @@ interface State {
   stdout?: string;
   stderr?: string;
   error?: string;
+  residentSetSizeBytes?: number;
+  totalTimeSecs?: number;
+  allowLongRun: boolean;
 }
 
 type wsExecuteRequestPayload = {
@@ -47,6 +57,14 @@ const { action: wsExecuteStderr, schema: wsExecuteStderrSchema } = createWebsock
   z.string(),
 );
 
+const { action: wsExecuteStatus, schema: wsExecuteStatusSchema } = createWebsocketResponse(
+  'output/execute/wsExecuteStatus',
+  z.object({
+    totalTimeSecs: z.number(),
+    residentSetSizeBytes: z.number(),
+  }),
+);
+
 const { action: wsExecuteEnd, schema: wsExecuteEndSchema } = createWebsocketResponse(
   'output/execute/wsExecuteEnd',
   z.object({
@@ -67,16 +85,18 @@ export interface ExecuteRequestBody {
   backtrace: boolean;
 }
 
-interface ExecuteResponseBody {
-  success: boolean;
-  exitDetail: string;
-  stdout: string;
-  stderr: string;
-}
+const ExecuteResponseBody = z.object({
+  success: z.boolean(),
+  exitDetail: z.string(),
+  stdout: z.string(),
+  stderr: z.string(),
+});
+type ExecuteResponseBody = z.infer<typeof ExecuteResponseBody>;
 
-export const performExecute = createAsyncThunk(sliceName, async (payload: ExecuteRequestBody) =>
-  adaptFetchError(() => jsonPost<ExecuteResponseBody>(routes.execute, payload)),
-);
+export const performExecute = createAsyncThunk(sliceName, async (payload: ExecuteRequestBody) => {
+  const d = await jsonPost(routes.execute, payload);
+  return ExecuteResponseBody.parseAsync(d);
+});
 
 const prepareWithCurrentSequenceNumber = <P>(payload: P, sequenceNumber: number) => ({
   payload,
@@ -109,6 +129,8 @@ const slice = createSlice({
         if (sequenceNumber >= (state.sequenceNumber ?? 0)) {
           state.sequenceNumber = sequenceNumber;
         }
+
+        state.requestsInProgress = 1; // Only tracking one request
       },
 
       prepare: (payload: wsExecuteRequestPayload) => ({
@@ -131,6 +153,9 @@ const slice = createSlice({
 
       prepare: prepareWithCurrentSequenceNumber,
     },
+    allowLongRun: (state) => {
+      state.allowLongRun = true;
+    },
   },
   extraReducers: (builder) => {
     builder
@@ -147,8 +172,7 @@ const slice = createSlice({
         state.requestsInProgress -= 1;
       })
       .addCase(performExecute.rejected, (state, action) => {
-        if (action.payload) {
-        } else {
+        if (!action.payload) {
           state.error = action.error.message;
         }
         state.requestsInProgress -= 1;
@@ -156,10 +180,13 @@ const slice = createSlice({
       .addCase(
         wsExecuteBegin,
         sequenceNumberMatches((state) => {
-          state.requestsInProgress = 1; // Only tracking one request
           state.stdout = '';
           state.stderr = '';
           delete state.error;
+
+          delete state.residentSetSizeBytes;
+          delete state.totalTimeSecs;
+          state.allowLongRun = false;
         }),
       )
       .addCase(
@@ -175,6 +202,12 @@ const slice = createSlice({
         }),
       )
       .addCase(
+        wsExecuteStatus,
+        sequenceNumberMatches((state, payload) => {
+          Object.assign(state, payload);
+        }),
+      )
+      .addCase(
         wsExecuteEnd,
         sequenceNumberMatches((state, payload) => {
           state.requestsInProgress = 0; // Only tracking one request
@@ -184,14 +217,20 @@ const slice = createSlice({
             state.error = payload.exitDetail;
           }
         }),
+      )
+      .addCase(
+        websocketError,
+        sequenceNumberMatches((state, payload) => {
+          state.error = payload.error;
+        }),
       );
   },
 });
 
-export const { wsExecuteRequest } = slice.actions;
+export const { wsExecuteRequest, allowLongRun, wsExecuteKill } = slice.actions;
 
 export const performCommonExecute =
-  (crateType: string, tests: boolean): SimpleThunkAction =>
+  (crateType: string, tests: boolean): ThunkAction =>
   (dispatch, getState) => {
     const state = getState();
     const body = executeRequestPayloadSelector(state, { crateType, tests });
@@ -205,31 +244,39 @@ export const performCommonExecute =
   };
 
 const dispatchWhenSequenceNumber =
-  <A extends AnyAction>(cb: (sequenceNumber: number) => A): SimpleThunkAction =>
+  <A extends UnknownAction>(cb: (sequenceNumber: number) => A): ThunkAction =>
   (dispatch, getState) => {
     const state = getState();
-    const { sequenceNumber } = state.output.execute;
+    const sequenceNumber = currentExecutionSequenceNumberSelector(state);
     if (sequenceNumber) {
       const action = cb(sequenceNumber);
       dispatch(action);
     }
   };
 
-export const wsExecuteStdin = (payload: string): SimpleThunkAction =>
+export const wsExecuteStdin = (payload: string): ThunkAction =>
   dispatchWhenSequenceNumber((sequenceNumber) =>
     slice.actions.wsExecuteStdin(payload, sequenceNumber),
   );
 
-export const wsExecuteStdinClose = (): SimpleThunkAction =>
+export const wsExecuteStdinClose = (): ThunkAction =>
   dispatchWhenSequenceNumber((sequenceNumber) =>
     slice.actions.wsExecuteStdinClose(undefined, sequenceNumber),
   );
 
-export const wsExecuteKill = (): SimpleThunkAction =>
+export const wsExecuteKillCurrent = (): ThunkAction =>
   dispatchWhenSequenceNumber((sequenceNumber) =>
     slice.actions.wsExecuteKill(undefined, sequenceNumber),
   );
 
-export { wsExecuteBeginSchema, wsExecuteStdoutSchema, wsExecuteStderrSchema, wsExecuteEndSchema };
+export {
+  wsExecuteBeginSchema,
+  wsExecuteStdoutSchema,
+  wsExecuteStderrSchema,
+  wsExecuteStatusSchema,
+  wsExecuteEndSchema,
+};
+
+export { wsExecuteStatus, wsExecuteEnd };
 
 export default slice.reducer;

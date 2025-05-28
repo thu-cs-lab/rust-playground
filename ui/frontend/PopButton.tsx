@@ -16,7 +16,7 @@ import {
 import React, { useCallback, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 
-import styles from './PopButton.module.css';
+import * as styles from './PopButton.module.css';
 
 export interface ButtonProps {
   toggle: () => void;
@@ -29,7 +29,7 @@ export interface MenuProps {
 interface NewPopProps {
   Button: React.ComponentType<ButtonProps & React.RefAttributes<HTMLButtonElement>>;
   Menu: React.ComponentType<MenuProps>;
-  menuContainer?: React.RefObject<HTMLDivElement>;
+  menuContainer?: React.RefObject<HTMLDivElement | null>;
 }
 
 const CONTAINER_STYLE: { [key in Placement]?: string } = {
@@ -72,7 +72,13 @@ const PopButton: React.FC<NewPopProps> = ({ Button, Menu, menuContainer }) => {
         }}
         {...getFloatingProps()}
       >
-        <FloatingArrow ref={arrowRef} context={context} height={10} width={20} fill="white" />
+        <FloatingArrow
+          ref={arrowRef}
+          context={context}
+          height={10}
+          width={20}
+          className={styles.arrow}
+        />
         <div className={containerClass}>
           <Menu close={close} />
         </div>

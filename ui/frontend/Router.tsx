@@ -1,14 +1,15 @@
 import React from 'react';
+import { Reducer, UnknownAction } from '@reduxjs/toolkit';
 
 import { createBrowserHistory as createHistory, Path, Location } from 'history';
-import { createRouter, PlainOrThunk } from './uss-router';
+import { createRouter, PlainOrThunk, RouterObject, StoreArg } from './uss-router';
 import UssRouter from './uss-router/Router';
 
 import qs from 'qs';
 import Route from 'route-parser';
 
 import * as actions from './actions';
-import State from './state';
+import { State } from './reducers';
 import { Channel, Edition, Mode, Page } from './types';
 
 const homeRoute = new Route(process.env.PUBLIC_URL + '');
@@ -64,7 +65,7 @@ const stateToLocation = ({ page, configuration, output }: Substate): Partial<Pat
   }
 };
 
-const locationToAction = (location: Location): PlainOrThunk<State, actions.Action> | null => {
+const locationToAction = (location: Location): PlainOrThunk<State, UnknownAction> | null => {
   const matchedHelp = helpRoute.match(location.pathname);
 
   if (matchedHelp) {
@@ -81,7 +82,7 @@ const locationToAction = (location: Location): PlainOrThunk<State, actions.Actio
 };
 
 export default class Router extends React.Component<RouterProps> {
-  private router: any;
+  private router: RouterObject<UnknownAction>;
 
   public constructor(props: RouterProps) {
     super(props);
@@ -103,6 +104,6 @@ export default class Router extends React.Component<RouterProps> {
 
 interface RouterProps {
   children: React.ReactNode;
-  store: any;
-  reducer: any;
+  store: StoreArg<State, UnknownAction>;
+  reducer: Reducer<State>;
 }

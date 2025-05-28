@@ -1,18 +1,19 @@
-import React, { useContext, useCallback, MouseEventHandler } from 'react';
-import { useDispatch } from 'react-redux';
+import React, { useContext, useCallback, MouseEventHandler, type JSX } from 'react';
 
 import { Context } from './Router';
+import { useAppDispatch } from '../hooks';
+import { UnknownAction } from '@reduxjs/toolkit';
 
 type Anchor = JSX.IntrinsicElements['a'];
 type SlimAnchor = Omit<Anchor, 'action' | 'onClick'>;
 
 export interface LinkProps extends SlimAnchor {
-  action?: () => any;
+  action: () => UnknownAction;
   onClick?: () => void;
 }
 
 const Link: React.FC<LinkProps> = (props) => {
-  const dispatch = useDispatch();
+  const dispatch = useAppDispatch();
   const router = useContext(Context);
   const { action, onClick, children, ...anchorProps } = props;
 

@@ -1,36 +1,41 @@
 import React, { useCallback } from 'react';
-import { useSelector } from 'react-redux';
 
 import ButtonMenuItem from './ButtonMenuItem';
 import MenuGroup from './MenuGroup';
 import MenuAside from './MenuAside';
 
 import * as selectors from './selectors';
-import * as actions from './actions';
-import { useAppDispatch } from './configureStore';
+import { useAppDispatch } from './hooks';
 import { performFormat } from './reducers/output/format';
+import { performClippy } from './reducers/output/clippy';
+import { performMiri } from './reducers/output/miri';
+import { performMacroExpansion } from './reducers/output/macroExpansion';
+import { useAppSelector } from './hooks';
 
 interface ToolsMenuProps {
   close: () => void;
 }
 
 const ToolsMenu: React.FC<ToolsMenuProps> = props => {
-  const rustfmtVersion = useSelector(selectors.rustfmtVersionText);
-  const rustfmtVersionDetails = useSelector(selectors.rustfmtVersionDetailsText);
-  const clippyVersionDetails = useSelector(selectors.clippyVersionDetailsText);
-  const clippyVersion = useSelector(selectors.clippyVersionText);
-  const miriVersionDetails = useSelector(selectors.miriVersionDetailsText);
-  const miriVersion = useSelector(selectors.miriVersionText);
-  const nightlyVersion = useSelector(selectors.nightlyVersionText);
-  const nightlyVersionDetails = useSelector(selectors.nightlyVersionDetailsText);
+  const rustfmtVersion = useAppSelector(selectors.rustfmtVersionText);
+  const rustfmtVersionDetails = useAppSelector(selectors.rustfmtVersionDetailsText);
+  const clippyVersionDetails = useAppSelector(selectors.clippyVersionDetailsText);
+  const clippyVersion = useAppSelector(selectors.clippyVersionText);
+  const miriVersionDetails = useAppSelector(selectors.miriVersionDetailsText);
+  const miriVersion = useAppSelector(selectors.miriVersionText);
+  const nightlyVersion = useAppSelector(selectors.nightlyVersionText);
+  const nightlyVersionDetails = useAppSelector(selectors.nightlyVersionDetailsText);
+
+  const miriRunningTests = useAppSelector(selectors.runAsTest);
+  const miriText = miriRunningTests ? "these tests" : "this program";
 
   const dispatch = useAppDispatch();
   const clippy = useCallback(() => {
-    dispatch(actions.performClippy());
+    dispatch(performClippy());
     props.close();
   }, [dispatch, props]);
   const miri = useCallback(() => {
-    dispatch(actions.performMiri());
+    dispatch(performMiri());
     props.close();
   }, [dispatch, props]);
   const format = useCallback(() => {
@@ -38,7 +43,7 @@ const ToolsMenu: React.FC<ToolsMenuProps> = props => {
     props.close();
   }, [dispatch, props]);
   const expandMacros = useCallback(() => {
-    dispatch(actions.performMacroExpansion());
+    dispatch(performMacroExpansion());
     props.close();
   }, [dispatch, props]);
 
@@ -60,7 +65,7 @@ const ToolsMenu: React.FC<ToolsMenuProps> = props => {
         name="Miri"
         onClick={miri}>
         <div>
-          Execute this program in the Miri interpreter to detect certain
+          Execute {miriText} in the Miri interpreter to detect certain
           cases of undefined behavior (like out-of-bounds memory access).
         </div>
         <MenuAside>{miriVersion} ({miriVersionDetails})</MenuAside>

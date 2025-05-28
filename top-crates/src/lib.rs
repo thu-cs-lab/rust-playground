@@ -6,11 +6,14 @@ use cargo::{
         package::PackageSet,
         registry::PackageRegistry,
         resolver::{self, features::RequestedFeatures, ResolveOpts, VersionPreferences},
-        source::SourceMap,
-        Dependency, Package, PackageId, QueryKind, Source, SourceId, Summary, Target,
+        Dependency, Package, PackageId, ResolveVersion, SourceId, Summary, Target,
     },
-    sources::RegistrySource,
-    util::{interning::InternedString, Config, VersionExt},
+    sources::{
+        source::{QueryKind, Source, SourceMap},
+        RegistrySource, SourceConfigMap,
+    },
+    util::{cache_lock::CacheLockMode, interning::InternedString, VersionExt},
+    GlobalContext,
 };
 use itertools::Itertools;
 use semver::Version;
@@ -26,7 +29,7 @@ use std::{
 const PLAYGROUND_TARGET_PLATFORM: &str = "x86_64-unknown-linux-gnu";
 
 struct GlobalState<'cfg> {
-    config: &'cfg Config,
+    config: &'cfg GlobalContext,
     target_info: TargetInfo,
     registry: PackageRegistry<'cfg>,
     crates_io: SourceId,
@@ -229,7 +232,7 @@ fn playground_metadata_features(pkg: &Package) -> Option<(BTreeSet<InternedStrin
 }
 
 fn make_global_state<'cfg>(
-    config: &'cfg Config,
+    config: &'cfg GlobalContext,
     modifications: &'cfg Modifications,
 ) -> GlobalState<'cfg> {
     // Information about the playground's target platform.
@@ -242,8 +245,11 @@ fn make_global_state<'cfg>(
     let target_info = TargetInfo::new(config, &[compile_kind], &rustc, compile_kind)
         .expect("Unable to create a TargetInfo");
 
+    let source_config = SourceConfigMap::empty(config).expect("Unable to create a SourceConfigMap");
+
     // Registry of known packages.
-    let mut registry = PackageRegistry::new(config).expect("Unable to create package registry");
+    let mut registry = PackageRegistry::new_with_source_config(config, source_config)
+        .expect("Unable to create package registry");
     registry.lock_patches();
 
     // Source for obtaining packages from the crates.io registry.
@@ -277,7 +283,7 @@ fn bulk_download(global: &mut GlobalState<'_>, package_ids: &[PackageId]) -> Vec
         .get_many(package_set.package_ids())
         .expect("Unable to download packages")
         .into_iter()
-        .map(Package::clone)
+        .cloned()
         .collect()
 }
 
@@ -311,11 +317,15 @@ fn populate_initial_direct_dependencies(
         // Find the newest non-prelease version
         let summary = matches
             .into_iter()
-            .filter(|summary| !summary.version().is_prerelease())
-            .max_by_key(|summary| summary.version().clone())
+            .filter(|summary| !summary.as_summary().version().is_prerelease())
+            .max_by_key(|summary| summary.as_summary().version().clone())
             .unwrap_or_else(|| panic!("Registry has no viable versions of {}", name));
 
-        let package_id = PackageId::pure(name, summary.version().clone(), global.crates_io);
+        let package_id = PackageId::new(
+            name,
+            summary.as_summary().version().clone(),
+            global.crates_io,
+        );
         package_ids.push(package_id);
     }
 
@@ -369,14 +379,14 @@ fn extend_direct_dependencies(
     let replacements = [];
     let version_prefs = VersionPreferences::default();
     let warnings = None;
-    let check_public_visible_dependencies = true;
+    let version = ResolveVersion::max_stable();
     let resolve = resolver::resolve(
         &summaries,
         &replacements,
         &mut global.registry,
         &version_prefs,
+        version,
         warnings,
-        check_public_visible_dependencies,
     )
     .expect("Unable to resolve dependencies");
 
@@ -437,8 +447,8 @@ pub fn generate_info(
     modifications: &Modifications,
 ) -> (BTreeMap<String, DependencySpec>, Vec<CrateInformation>) {
     // Setup to interact with cargo.
-    let config = Config::default().expect("Unable to create default Cargo config");
-    let _lock = config.acquire_package_cache_lock();
+    let config = GlobalContext::default().expect("Unable to create default Cargo config");
+    let _lock = config.acquire_package_cache_lock(CacheLockMode::DownloadExclusive);
     let mut global = make_global_state(&config, modifications);
 
     let mut resolved_crates = populate_initial_direct_dependencies(&mut global);
@@ -470,7 +480,7 @@ fn generate_dependency_specs(
     });
 
     let mut dependencies = BTreeMap::new();
-    for (name, pkgs) in &crates.iter().group_by(|dep| dep.summary.name()) {
+    for (name, pkgs) in &crates.iter().chunk_by(|dep| dep.summary.name()) {
         let mut first = true;
 
         for dep in pkgs {

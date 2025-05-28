@@ -6,6 +6,7 @@ import {
   Backtrace,
   Channel,
   Edition,
+  AliasingModel,
   Focus,
   Orientation,
   PrimaryActionAuto,
@@ -20,7 +21,15 @@ export const selectionSelector = (state: State) => state.selection;
 const HAS_TESTS_RE = /^\s*#\s*\[\s*test\s*([^"]*)]/m;
 export const hasTestsSelector = createSelector(codeSelector, code => !!code.match(HAS_TESTS_RE));
 
-const HAS_MAIN_FUNCTION_RE = /^\s*(pub\s+)?\s*(const\s+)?\s*(async\s+)?\s*fn\s+main\s*\(\s*\)/m;
+// https://stackoverflow.com/a/34755045/155423
+const HAS_MAIN_FUNCTION_RE = new RegExp(
+  [
+    /^([^\n\r/]*;)?/,
+    /\s*(pub\s+)?\s*(const\s+)?\s*(async\s+)?\s*/,
+    /fn\s+main\s*\(\s*(\/\*.*\*\/)?\s*\)/,
+  ].map((r) => r.source).join(''),
+  'm'
+);
 export const hasMainFunctionSelector = createSelector(codeSelector, code => !!code.match(HAS_MAIN_FUNCTION_RE));
 
 const CRATE_TYPE_RE = /^\s*#!\s*\[\s*crate_type\s*=\s*"([^"]*)"\s*]/m;
@@ -99,12 +108,29 @@ const LABELS: { [index in PrimaryActionCore]: string } = {
 
 export const getExecutionLabel = createSelector(primaryActionSelector, primaryAction => LABELS[primaryAction]);
 
-const getStable = (state: State) => state.versions?.stable;
-const getBeta = (state: State) => state.versions?.beta;
-const getNightly = (state: State) => state.versions?.nightly;
-const getRustfmt = (state: State) => state.versions?.rustfmt;
-const getClippy = (state: State) => state.versions?.clippy;
-const getMiri = (state: State) => state.versions?.miri;
+const channelSelector = (state: State) => state.configuration.channel;
+
+const selectedChannelVersionsSelector = createSelector(
+  channelSelector,
+  (state: State) => state.versions,
+  (channel, versions) => {
+    switch (channel) {
+      case Channel.Stable:
+        return versions.stable;
+      case Channel.Beta:
+        return versions.beta;
+      case Channel.Nightly:
+        return versions.nightly;
+    }
+  },
+)
+
+const getStable = (state: State) => state.versions.stable?.rustc;
+const getBeta = (state: State) => state.versions.beta?.rustc;
+const getNightly = (state: State) => state.versions.nightly?.rustc;
+const getRustfmt = createSelector(selectedChannelVersionsSelector, (versions) => versions?.rustfmt);
+const getClippy = createSelector(selectedChannelVersionsSelector, (versions) => versions?.clippy);
+const getMiri = (state: State) => state.versions?.nightly?.miri;
 
 const versionNumber = (v: Version | undefined) => v ? v.version : '';
 export const stableVersionText = createSelector(getStable, versionNumber);
@@ -122,9 +148,11 @@ export const rustfmtVersionDetailsText = createSelector(getRustfmt, versionDetai
 export const miriVersionDetailsText = createSelector(getMiri, versionDetails);
 
 const editionSelector = (state: State) => state.configuration.edition;
+export const aliasingModelSelector = (state: State) => state.configuration.aliasingModel;
 
-export const isNightlyChannel = (state: State) => (
-  state.configuration.channel === Channel.Nightly
+export const isNightlyChannel = createSelector(
+  channelSelector,
+  (channel) => channel === Channel.Nightly,
 );
 export const isHirAvailable = isNightlyChannel;
 
@@ -142,42 +170,47 @@ export const getModeLabel = (state: State) => {
   return `${mode}`;
 };
 
-export const getChannelLabel = (state: State) => {
-  const { configuration: { channel } } = state;
-  return `${channel}`;
-};
+export const getChannelLabel = createSelector(channelSelector, (channel) => `${channel}`);
 
 export const isEditionDefault = createSelector(
   editionSelector,
-  edition => edition == Edition.Rust2021,
+  edition => edition === Edition.Rust2024,
 );
 
-export const getBacktraceSet = (state: State) => (
-  state.configuration.backtrace !== Backtrace.Disabled
+export const isBacktraceDefault = (state: State) => (
+  state.configuration.backtrace === Backtrace.Disabled
+);
+
+export const getBacktraceSet = createSelector(isBacktraceDefault, (b) => !b);
+
+export const isAliasingModelDefault = createSelector(
+  aliasingModelSelector,
+  aliasingModel => aliasingModel == AliasingModel.Stacked,
 );
 
 export const getAdvancedOptionsSet = createSelector(
-  isEditionDefault, getBacktraceSet,
-  (editionDefault, backtraceSet) => (
-    !editionDefault || backtraceSet
-  ),
+  isEditionDefault, isBacktraceDefault, isAliasingModelDefault,
+  (...areDefault) => !areDefault.every(n => n),
 );
 
-export const hasProperties = (obj: {}) => Object.values(obj).some(val => !!val);
+export const hasProperties = (obj: object) => Object.values(obj).some(val => !!val);
 
-const getOutputs = (state: State) => [
-  state.output.assembly,
-  state.output.clippy,
-  state.output.execute,
-  state.output.format,
-  state.output.gist,
-  state.output.llvmIr,
-  state.output.mir,
-  state.output.hir,
-  state.output.miri,
-  state.output.macroExpansion,
-  state.output.wasm,
-];
+const getOutputs = createSelector(
+  (state: State) => state,
+  (state) => [
+    state.output.assembly,
+    state.output.clippy,
+    state.output.execute,
+    state.output.format,
+    state.output.gist,
+    state.output.llvmIr,
+    state.output.mir,
+    state.output.hir,
+    state.output.miri,
+    state.output.macroExpansion,
+    state.output.wasm,
+  ],
+);
 
 export const getSomethingToShow = createSelector(
   getOutputs,
@@ -186,6 +219,49 @@ export const getSomethingToShow = createSelector(
 
 export const baseUrlSelector = (state: State) =>
   state.globalConfiguration.baseUrl;
+
+const excessiveExecutionTimeSSelector = (state: State) =>
+  state.globalConfiguration.excessiveExecutionTimeS;
+
+const killGracePeriodSSelector = (state: State) =>
+  state.globalConfiguration.killGracePeriodS;
+
+export const killGracePeriodMsSelector = createSelector(
+  killGracePeriodSSelector,
+  (t) => t * 1000,
+);
+
+const formatSeconds = (seconds: number) => {
+  if (seconds === 1) {
+    return '1 second';
+  } else if (seconds % 1 === 0) {
+    return `${seconds.toFixed(0)} seconds`;
+  } else {
+    return `${seconds.toFixed(1)} seconds`;
+  }
+};
+
+export const excessiveExecutionTimeSelector = createSelector(
+  excessiveExecutionTimeSSelector,
+  formatSeconds,
+);
+
+export const killGracePeriodTimeSelector = createSelector(
+  killGracePeriodSSelector,
+  formatSeconds,
+);
+
+export const currentExecutionSequenceNumberSelector = (state: State) =>
+  state.output.execute.sequenceNumber;
+
+export const excessiveExecutionSelector = createSelector(
+  (state: State) => state.output.execute,
+  excessiveExecutionTimeSSelector,
+  (e, limit) =>
+    e.requestsInProgress > 0 &&
+    !e.allowLongRun &&
+    (e.totalTimeSecs ?? 0.0) >= limit,
+);
 
 const gistSelector = (state: State) =>
   state.output.gist;
@@ -291,29 +367,46 @@ const notificationsSelector = (state: State) => state.notifications;
 
 const NOW = new Date();
 
-const RUST_SURVEY_2022_END = new Date('2022-12-19T00:00:00Z');
-const RUST_SURVEY_2022_OPEN = NOW <= RUST_SURVEY_2022_END;
-export const showRustSurvey2022Selector = createSelector(
+const RUST_2024_IS_DEFAULT_END = new Date('2025-04-03T00:00:00Z');
+const RUST_2024_IS_DEFAULT_OPEN = NOW <= RUST_2024_IS_DEFAULT_END;
+export const showRust2024IsDefaultSelector = createSelector(
   notificationsSelector,
-  notifications => RUST_SURVEY_2022_OPEN && !notifications.seenRustSurvey2022,
+  notifications => RUST_2024_IS_DEFAULT_OPEN && !notifications.seenRust2024IsDefault,
 );
 
 export const anyNotificationsToShowSelector = createSelector(
-  showRustSurvey2022Selector,
+  showRust2024IsDefaultSelector,
+  excessiveExecutionSelector,
   (...allNotifications) => allNotifications.some(n => n),
 );
 
 export const clippyRequestSelector = createSelector(
-  codeSelector,
-  editionSelector,
+  channelSelector,
   getCrateType,
-  (code, edition, crateType) => ({ code, edition, crateType }),
+  editionSelector,
+  codeSelector,
+  (channel, crateType, edition, code) => ({ channel, crateType, edition, code }),
 );
 
 export const formatRequestSelector = createSelector(
-  codeSelector,
+  channelSelector,
   editionSelector,
-  (code, edition) => ({ code, edition }),
+  codeSelector,
+  (channel, edition, code) => ({ channel, edition, code }),
+);
+
+export const miriRequestSelector = createSelector(
+  editionSelector,
+  runAsTest,
+  aliasingModelSelector,
+  codeSelector,
+  (edition, tests, aliasingModel, code, ) => ({ edition, tests, aliasingModel, code }),
+);
+
+export const macroExpansionRequestSelector = createSelector(
+  editionSelector,
+  codeSelector,
+  (edition, code) => ({ edition, code })
 );
 
 const focus = (state: State) => state.output.meta.focus;
@@ -387,11 +480,12 @@ export const websocketStatusSelector = createSelector(
 
 export const executeRequestPayloadSelector = createSelector(
   codeSelector,
+  channelSelector,
   (state: State) => state.configuration,
   getBacktraceSet,
-  (_state: State, { crateType, tests }: { crateType: string, tests: boolean }) => ({ crateType, tests }),
-  (code, configuration, backtrace, { crateType, tests }) => ({
-    channel: configuration.channel,
+  (_state: State, args: { crateType: string, tests: boolean }) => args,
+  (code, channel, configuration, backtrace, { crateType, tests }) => ({
+    channel,
     mode: configuration.mode,
     edition: configuration.edition,
     crateType,
@@ -403,13 +497,14 @@ export const executeRequestPayloadSelector = createSelector(
 
 export const compileRequestPayloadSelector = createSelector(
   codeSelector,
+  channelSelector,
   (state: State) => state.configuration,
   getCrateType,
   runAsTest,
   getBacktraceSet,
-  (_state: State, { target }: { target: string }) => ({ target }),
-  (code, configuration, crateType, tests, backtrace, { target }) => ({
-    channel: configuration.channel,
+  (_state: State, args: { target: string }) => args,
+  (code, channel, configuration, crateType, tests, backtrace, { target }) => ({
+    channel,
     mode: configuration.mode,
     edition: configuration.edition,
     crateType,
@@ -421,4 +516,9 @@ export const compileRequestPayloadSelector = createSelector(
     processAssembly: configuration.processAssembly,
     backtrace,
   }),
+);
+
+export const themeSelector = createSelector(
+  (state: State) => state,
+  (state) => state.configuration.theme,
 );

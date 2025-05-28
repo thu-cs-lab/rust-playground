@@ -1,8 +1,8 @@
-import React from 'react';
+import React, { type JSX } from 'react';
 
 import MenuItem from './MenuItem';
 
-import styles from './ButtonMenuItem.module.css';
+import * as styles from './ButtonMenuItem.module.css';
 
 type Button = JSX.IntrinsicElements['button'];
 

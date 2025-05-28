@@ -1,5 +1,4 @@
 import React, { RefObject, useCallback, useRef } from 'react';
-import { useSelector } from 'react-redux';
 
 import AdvancedOptionsMenu from './AdvancedOptionsMenu';
 import BuildMenu from './BuildMenu';
@@ -18,11 +17,12 @@ import ModeMenu from './ModeMenu';
 import PopButton, { ButtonProps } from './PopButton';
 import ToolsMenu from './ToolsMenu';
 import * as actions from './actions';
-import { useAppDispatch } from './configureStore';
+import { useAppDispatch, useAppSelector } from './hooks';
 import { performGistSave } from './reducers/output/gist';
+import { navigateToHelp } from './reducers/page';
 import * as selectors from './selectors';
 
-import styles from './Header.module.css';
+import * as styles from './Header.module.css';
 
 const Header: React.FC = () => {
   const menuContainer = useRef<HTMLDivElement | null>(null);
@@ -70,11 +70,11 @@ const Header: React.FC = () => {
 };
 
 interface PortalProps {
-  menuContainer: RefObject<HTMLDivElement>;
+  menuContainer: RefObject<HTMLDivElement | null>;
 }
 
 const ExecuteButton: React.FC = () => {
-  const executionLabel = useSelector(selectors.getExecutionLabel);
+  const executionLabel = useAppSelector(selectors.getExecutionLabel);
 
   const dispatch = useAppDispatch();
   const execute = useCallback(() => dispatch(actions.performPrimaryAction()), [dispatch]);
@@ -98,7 +98,7 @@ const BuildMenuButton: React.FC<PortalProps> = ({ menuContainer }) => {
 };
 
 const ModeMenuButton: React.FC<PortalProps> = ({ menuContainer }) => {
-  const label = useSelector(selectors.getModeLabel);
+  const label = useAppSelector(selectors.getModeLabel);
 
   const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(({ toggle }, ref) => (
     <OneButton
@@ -117,7 +117,7 @@ const ModeMenuButton: React.FC<PortalProps> = ({ menuContainer }) => {
 };
 
 const ChannelMenuButton: React.FC<PortalProps> = ({ menuContainer }) => {
-  const label = useSelector(selectors.getChannelLabel);
+  const label = useAppSelector(selectors.getChannelLabel);
 
   const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(({ toggle }, ref) => (
     <OneButton
@@ -136,7 +136,7 @@ const ChannelMenuButton: React.FC<PortalProps> = ({ menuContainer }) => {
 };
 
 const AdvancedOptionsMenuButton: React.FC<PortalProps> = ({ menuContainer }) => {
-  const advancedOptionsSet = useSelector(selectors.getAdvancedOptionsSet);
+  const advancedOptionsSet = useAppSelector(selectors.getAdvancedOptionsSet);
 
   const Button = React.forwardRef<HTMLButtonElement, ButtonProps>(({ toggle }, ref) => (
     <IconButton type="button" title="Advanced compilation flags" ref={ref} onClick={toggle}>
@@ -195,7 +195,7 @@ const ConfigMenuButton: React.FC<PortalProps> = ({ menuContainer }) => {
 };
 
 const HelpButton: React.FC = () => (
-  <IconLink title="View help" action={actions.navigateToHelp}>
+  <IconLink title="View help" action={navigateToHelp}>
     <HelpIcon />
   </IconLink>
 );

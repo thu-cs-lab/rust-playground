@@ -1,13 +1,14 @@
 #![deny(rust_2018_idioms)]
 
-use crate::env::{PLAYGROUND_GITHUB_TOKEN, PLAYGROUND_UI_ROOT};
-use serde::{Deserialize, Serialize};
-use snafu::prelude::*;
+use orchestrator::coordinator::{
+    limits::{self, Acquisition},
+    CoordinatorFactory, ResourceLimits,
+};
 use std::{
-    convert::TryFrom,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
@@ -15,16 +16,28 @@ use tracing_subscriber::EnvFilter;
 const DEFAULT_ADDRESS: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5000;
 
+const DEFAULT_WEBSOCKET_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_WEBSOCKET_SESSION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+
+const DEFAULT_COORDINATORS_LIMIT: usize = 25;
+const DEFAULT_PROCESSES_LIMIT: usize = 10;
+
 mod env;
 mod gist;
 mod metrics;
-mod sandbox;
+mod public_http_api;
+mod request_database;
 mod server_axum;
+
+use env::{PLAYGROUND_GITHUB_TOKEN, PLAYGROUND_UI_ROOT};
 
 fn main() {
     // Dotenv may be unable to load environment variables, but that's ok in production
     let _ = dotenv::dotenv();
-    openssl_probe::init_ssl_cert_env_vars();
+    // SAFETY: We have not started any other threads yet.
+    unsafe {
+        openssl_probe::init_openssl_env_vars();
+    }
 
     // Info-level logging is enabled by default.
     tracing_subscriber::fmt()
@@ -45,6 +58,9 @@ struct Config {
     gh_token: Option<String>,
     metrics_token: Option<String>,
     feature_flags: FeatureFlags,
+    request_db_path: Option<PathBuf>,
+    websocket_config: WebSocketConfig,
+    limits: Arc<dyn ResourceLimits>,
     port: u16,
     root: PathBuf,
     public_url: String,
@@ -102,12 +118,50 @@ impl Config {
 
         let feature_flags = FeatureFlags {};
 
+        let request_db_path = env::var_os("PLAYGROUND_REQUEST_DATABASE").map(Into::into);
+
+        let websocket_config = {
+            let idle_timeout = env::var("PLAYGROUND_WEBSOCKET_IDLE_TIMEOUT_S")
+                .ok()
+                .and_then(|l| l.parse().map(Duration::from_secs).ok())
+                .unwrap_or(DEFAULT_WEBSOCKET_IDLE_TIMEOUT);
+
+            let session_timeout = env::var("PLAYGROUND_WEBSOCKET_SESSION_TIMEOUT_S")
+                .ok()
+                .and_then(|l| l.parse().map(Duration::from_secs).ok())
+                .unwrap_or(DEFAULT_WEBSOCKET_SESSION_TIMEOUT);
+
+            WebSocketConfig {
+                idle_timeout,
+                session_timeout,
+            }
+        };
+
+        let coordinators_limit = env::var("PLAYGROUND_COORDINATORS_LIMIT")
+            .ok()
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(DEFAULT_COORDINATORS_LIMIT);
+
+        let processes_limit = env::var("PLAYGROUND_PROCESSES_LIMIT")
+            .ok()
+            .and_then(|l| l.parse().ok())
+            .unwrap_or(DEFAULT_PROCESSES_LIMIT);
+
+        let limits = Arc::new(limits::Global::with_lifecycle(
+            coordinators_limit,
+            processes_limit,
+            LifecycleMetrics,
+        ));
+
         Self {
             address,
             cors_enabled,
             gh_token,
             metrics_token,
             feature_flags,
+            request_db_path,
+            websocket_config,
+            limits,
             port,
             root,
             public_url,
@@ -134,6 +188,21 @@ impl Config {
         GhToken::new(&self.gh_token)
     }
 
+    fn request_database(&self) -> request_database::Database {
+        use request_database::Database;
+
+        let request_db = match &self.request_db_path {
+            Some(path) => Database::initialize(path),
+            None => Database::initialize_memory(),
+        };
+
+        request_db.expect("Unable to open request log database")
+    }
+
+    fn coordinator_factory(&self) -> CoordinatorFactory {
+        CoordinatorFactory::new(self.limits.clone())
+    }
+
     fn server_socket_addr(&self) -> SocketAddr {
         let address = self.address.parse().expect("Invalid address");
         SocketAddr::new(address, self.port)
@@ -147,13 +216,6 @@ impl GhToken {
     fn new(token: &Option<String>) -> Self {
         GhToken(token.clone().map(Arc::new))
     }
-
-    fn must_get(&self) -> Result<String> {
-        self.0
-            .as_ref()
-            .map(|s| String::clone(s))
-            .context(NoGithubTokenSnafu)
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -165,376 +227,45 @@ impl MetricsToken {
     }
 }
 
-#[derive(Debug, Snafu)]
-enum Error {
-    #[snafu(display("Sandbox creation failed: {}", source))]
-    SandboxCreation { source: sandbox::Error },
-    #[snafu(display("Expansion operation failed: {}", source))]
-    Expansion { source: sandbox::Error },
-    #[snafu(display("Interpreting operation failed: {}", source))]
-    Interpreting { source: sandbox::Error },
-    #[snafu(display("Caching operation failed: {}", source))]
-    Caching { source: sandbox::Error },
-    #[snafu(display("Gist creation failed: {}", source))]
-    GistCreation { source: octocrab::Error },
-    #[snafu(display("Gist loading failed: {}", source))]
-    GistLoading { source: octocrab::Error },
-    #[snafu(display("{PLAYGROUND_GITHUB_TOKEN} not set up for reading/writing gists"))]
-    NoGithubToken,
-    #[snafu(display("Unable to deserialize request: {}", source))]
-    Deserialization { source: serde_json::Error },
-    #[snafu(display("Unable to serialize response: {}", source))]
-    Serialization { source: serde_json::Error },
+#[derive(Debug, Copy, Clone)]
+struct LifecycleMetrics;
 
-    #[snafu(context(false))]
-    EvaluateRequest {
-        source: server_axum::api_orchestrator_integration_impls::ParseEvaluateRequestError,
-    },
-
-    #[snafu(context(false))]
-    CompileRequest {
-        source: server_axum::api_orchestrator_integration_impls::ParseCompileRequestError,
-    },
-
-    #[snafu(context(false))]
-    ExecuteRequest {
-        source: server_axum::api_orchestrator_integration_impls::ParseExecuteRequestError,
-    },
-
-    #[snafu(context(false))]
-    FormatRequest {
-        source: server_axum::api_orchestrator_integration_impls::ParseFormatRequestError,
-    },
-
-    #[snafu(context(false))]
-    ClippyRequest {
-        source: server_axum::api_orchestrator_integration_impls::ParseClippyRequestError,
-    },
-
-    // Remove at a later point. From here ...
-    #[snafu(display("The value {:?} is not a valid edition", value))]
-    InvalidEdition { value: String },
-    // ... to here
-    #[snafu(display("No request was provided"))]
-    RequestMissing,
-    #[snafu(display("The cache has been poisoned"))]
-    CachePoisoned,
-    #[snafu(display("The WebSocket worker panicked: {}", text))]
-    WebSocketTaskPanic { text: String },
-
-    #[snafu(display("Unable to shutdown the coordinator"))]
-    ShutdownCoordinator {
-        source: orchestrator::coordinator::Error,
-    },
-
-    #[snafu(display("Unable to convert the evaluate request"))]
-    Evaluate {
-        source: orchestrator::coordinator::ExecuteError,
-    },
-
-    #[snafu(display("Unable to convert the compile request"))]
-    Compile {
-        source: orchestrator::coordinator::CompileError,
-    },
-
-    #[snafu(display("Unable to convert the execute request"))]
-    Execute {
-        source: orchestrator::coordinator::ExecuteError,
-    },
-
-    #[snafu(display("Unable to convert the format request"))]
-    Format {
-        source: orchestrator::coordinator::FormatError,
-    },
-
-    #[snafu(display("Unable to convert the Clippy request"))]
-    Clippy {
-        source: orchestrator::coordinator::ClippyError,
-    },
-
-    #[snafu(display("The operation timed out"))]
-    Timeout { source: tokio::time::error::Elapsed },
-
-    #[snafu(display("Unable to spawn a coordinator task"))]
-    StreamingCoordinatorSpawn {
-        source: server_axum::WebsocketCoordinatorManagerError,
-    },
-
-    #[snafu(display("Unable to idle the coordinator"))]
-    StreamingCoordinatorIdle {
-        source: server_axum::WebsocketCoordinatorManagerError,
-    },
-
-    #[snafu(display("Unable to perform a streaming execute"))]
-    StreamingExecute {
-        source: server_axum::WebsocketExecuteError,
-    },
-
-    #[snafu(display("Unable to pass stdin to the active execution"))]
-    StreamingCoordinatorExecuteStdin {
-        source: tokio::sync::mpsc::error::SendError<()>,
-    },
-}
-
-type Result<T, E = Error> = ::std::result::Result<T, E>;
-
-#[derive(Debug, Clone, Serialize)]
-struct ErrorJson {
-    error: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct CompileRequest {
-    target: String,
-    #[serde(rename = "assemblyFlavor")]
-    assembly_flavor: Option<String>,
-    #[serde(rename = "demangleAssembly")]
-    demangle_assembly: Option<String>,
-    #[serde(rename = "processAssembly")]
-    process_assembly: Option<String>,
-    channel: String,
-    mode: String,
-    #[serde(default)]
-    edition: String,
-    #[serde(rename = "crateType")]
-    crate_type: String,
-    tests: bool,
-    #[serde(default)]
-    backtrace: bool,
-    code: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct CompileResponse {
-    success: bool,
-    #[serde(rename = "exitDetail")]
-    exit_detail: String,
-    code: String,
-    stdout: String,
-    stderr: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ExecuteRequest {
-    channel: String,
-    mode: String,
-    #[serde(default)]
-    edition: String,
-    #[serde(rename = "crateType")]
-    crate_type: String,
-    tests: bool,
-    #[serde(default)]
-    backtrace: bool,
-    code: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ExecuteResponse {
-    success: bool,
-    #[serde(rename = "exitDetail")]
-    exit_detail: String,
-    stdout: String,
-    stderr: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct FormatRequest {
-    code: String,
-    #[serde(default)]
-    edition: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct FormatResponse {
-    success: bool,
-    #[serde(rename = "exitDetail")]
-    exit_detail: String,
-    code: String,
-    stdout: String,
-    stderr: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct ClippyRequest {
-    code: String,
-    #[serde(default)]
-    edition: String,
-    #[serde(default = "default_crate_type", rename = "crateType")]
-    crate_type: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ClippyResponse {
-    success: bool,
-    exit_detail: String,
-    stdout: String,
-    stderr: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct MiriRequest {
-    code: String,
-    #[serde(default)]
-    edition: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MiriResponse {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct MacroExpansionRequest {
-    code: String,
-    #[serde(default)]
-    edition: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MacroExpansionResponse {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct CrateInformation {
-    name: String,
-    version: String,
-    id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct MetaCratesResponse {
-    crates: Arc<[CrateInformation]>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-struct MetaVersionResponse {
-    version: Arc<str>,
-    hash: Arc<str>,
-    date: Arc<str>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct MetaGistCreateRequest {
-    code: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct MetaGistResponse {
-    id: String,
-    url: String,
-    code: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct EvaluateRequest {
-    version: String,
-    optimize: String,
-    code: String,
-    #[serde(default)]
-    edition: String,
-    #[serde(default)]
-    tests: bool,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct EvaluateResponse {
-    result: String,
-    error: Option<String>,
-}
-
-impl TryFrom<MiriRequest> for sandbox::MiriRequest {
-    type Error = Error;
-
-    fn try_from(me: MiriRequest) -> Result<Self> {
-        Ok(sandbox::MiriRequest {
-            code: me.code,
-            edition: parse_edition(&me.edition)?,
-        })
+impl limits::Lifecycle for LifecycleMetrics {
+    fn container_start(&self) {
+        metrics::CONTAINER_QUEUE.inc();
     }
-}
 
-impl From<sandbox::MiriResponse> for MiriResponse {
-    fn from(me: sandbox::MiriResponse) -> Self {
-        MiriResponse {
-            success: me.success,
-            stdout: me.stdout,
-            stderr: me.stderr,
+    fn container_acquired(&self, how: limits::Acquisition) {
+        metrics::CONTAINER_QUEUE.dec();
+
+        if how == Acquisition::Acquired {
+            metrics::CONTAINER_ACTIVE.inc();
         }
     }
-}
 
-impl TryFrom<MacroExpansionRequest> for sandbox::MacroExpansionRequest {
-    type Error = Error;
-
-    fn try_from(me: MacroExpansionRequest) -> Result<Self> {
-        Ok(sandbox::MacroExpansionRequest {
-            code: me.code,
-            edition: parse_edition(&me.edition)?,
-        })
+    fn container_release(&self) {
+        metrics::CONTAINER_ACTIVE.dec();
     }
-}
 
-impl From<sandbox::MacroExpansionResponse> for MacroExpansionResponse {
-    fn from(me: sandbox::MacroExpansionResponse) -> Self {
-        MacroExpansionResponse {
-            success: me.success,
-            stdout: me.stdout,
-            stderr: me.stderr,
+    fn process_start(&self) {
+        metrics::PROCESS_QUEUE.inc();
+    }
+
+    fn process_acquired(&self, how: limits::Acquisition) {
+        metrics::PROCESS_QUEUE.dec();
+
+        if how == Acquisition::Acquired {
+            metrics::PROCESS_ACTIVE.inc();
         }
     }
-}
 
-impl From<Vec<sandbox::CrateInformation>> for MetaCratesResponse {
-    fn from(me: Vec<sandbox::CrateInformation>) -> Self {
-        let crates = me
-            .into_iter()
-            .map(|cv| CrateInformation {
-                name: cv.name,
-                version: cv.version,
-                id: cv.id,
-            })
-            .collect();
-
-        MetaCratesResponse { crates }
+    fn process_release(&self) {
+        metrics::PROCESS_ACTIVE.dec();
     }
 }
 
-impl From<sandbox::Version> for MetaVersionResponse {
-    fn from(me: sandbox::Version) -> Self {
-        MetaVersionResponse {
-            version: me.release.into(),
-            hash: me.commit_hash.into(),
-            date: me.commit_date.into(),
-        }
-    }
-}
-
-impl From<gist::Gist> for MetaGistResponse {
-    fn from(me: gist::Gist) -> Self {
-        MetaGistResponse {
-            id: me.id,
-            url: me.url,
-            code: me.code,
-        }
-    }
-}
-
-fn parse_edition(s: &str) -> Result<Option<sandbox::Edition>> {
-    Ok(match s {
-        "" => None,
-        "2015" => Some(sandbox::Edition::Rust2015),
-        "2018" => Some(sandbox::Edition::Rust2018),
-        "2021" => Some(sandbox::Edition::Rust2021),
-        "2024" => Some(sandbox::Edition::Rust2024),
-        value => InvalidEditionSnafu { value }.fail()?,
-    })
-}
-
-fn default_crate_type() -> String {
-    "bin".into()
+#[derive(Debug, Copy, Clone)]
+struct WebSocketConfig {
+    idle_timeout: Duration,
+    session_timeout: Duration,
 }

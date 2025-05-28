@@ -1,15 +1,17 @@
 import { PayloadAction, createSlice } from '@reduxjs/toolkit';
 import { Draft } from 'immer';
 
-import { ActionType } from '../../actions';
 import { Focus } from '../../types';
 import { performCompileAssembly } from './assembly';
+import { performClippy } from './clippy';
 import { performExecute, wsExecuteRequest } from './execute';
 import { performFormat } from './format';
 import { performGistLoad, performGistSave } from './gist';
 import { performCompileHir } from './hir';
 import { performCompileLlvmIr } from './llvmIr';
+import { performMacroExpansion } from './macroExpansion';
 import { performCompileMir } from './mir';
+import { performMiri } from './miri';
 import { performCompileWasm } from './wasm';
 
 const initialState: State = {};
@@ -35,15 +37,15 @@ const slice = createSlice({
   },
   extraReducers: (builder) => {
     builder
-      .addCase(ActionType.RequestClippy, (state) => {
+      .addCase(performClippy.pending, (state) => {
         state.focus = Focus.Clippy;
       })
 
-      .addCase(ActionType.RequestMiri, (state) => {
+      .addCase(performMiri.pending, (state) => {
         state.focus = Focus.Miri;
       })
 
-      .addCase(ActionType.RequestMacroExpansion, (state) => {
+      .addCase(performMacroExpansion.pending, (state) => {
         state.focus = Focus.MacroExpansion;
       })
 

@@ -8,7 +8,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import { Crate, PairCharacters, Position, Selection } from '../types';
 
-import styles from './Editor.module.css';
+import * as styles from './Editor.module.css';
 
 // The keybinding and theme need to be loaded **after** the Ace
 // library because they use the global value it provides. Loading this
@@ -64,8 +64,8 @@ const buildCrateAutocompleter = (autocompleteOnUse: boolean, crates: Crate[]): A
   },
 });
 
-function useRafDebouncedFunction<A extends any[]>(fn: (...args: A) => void, onCall?: (...args: A) => void) {
-  const timeout = useRef<number>();
+function useRafDebouncedFunction<A extends unknown[]>(fn: (...args: A) => void, onCall?: (...args: A) => void) {
+  const timeout = useRef<number>(undefined);
 
   return useCallback((...args: A): void => {
     if (timeout.current) {
@@ -82,9 +82,9 @@ function useRafDebouncedFunction<A extends any[]>(fn: (...args: A) => void, onCa
 interface AceEditorProps {
   autocompleteOnUse: boolean;
   code: string;
-  execute: () => any;
+  execute: () => void;
   keybinding: string;
-  onEditCode: (_: string) => any;
+  onEditCode: (_: string) => void;
   position: Position;
   selection: Selection;
   theme: string;

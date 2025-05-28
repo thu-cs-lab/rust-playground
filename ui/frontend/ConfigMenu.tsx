@@ -1,13 +1,12 @@
 /* global ACE_KEYBINDINGS:false, ACE_THEMES:false */
 
 import React, { Fragment, useCallback } from 'react';
-import { useDispatch, useSelector } from 'react-redux';
 
 import { Either as EitherConfig, Select as SelectConfig } from './ConfigElement';
 import MenuGroup from './MenuGroup';
+import { useAppDispatch, useAppSelector } from './hooks';
 
-import * as actions from './actions';
-import State from './state';
+import * as config from './reducers/configuration';
 import {
   AssemblyFlavor,
   DemangleAssembly,
@@ -15,6 +14,7 @@ import {
   Orientation,
   PairCharacters,
   ProcessAssembly,
+  Theme,
 } from './types';
 
 const MONACO_THEMES = [
@@ -22,30 +22,32 @@ const MONACO_THEMES = [
 ];
 
 const ConfigMenu: React.FC = () => {
-  const keybinding = useSelector((state: State) => state.configuration.ace.keybinding);
-  const aceTheme = useSelector((state: State) => state.configuration.ace.theme);
-  const monacoTheme = useSelector((state: State) => state.configuration.monaco.theme);
-  const orientation = useSelector((state: State) => state.configuration.orientation);
-  const editorStyle = useSelector((state: State) => state.configuration.editor);
-  const pairCharacters = useSelector((state: State) => state.configuration.ace.pairCharacters);
-  const assemblyFlavor = useSelector((state: State) => state.configuration.assemblyFlavor);
-  const demangleAssembly = useSelector((state: State) => state.configuration.demangleAssembly);
-  const processAssembly = useSelector((state: State) => state.configuration.processAssembly);
+  const keybinding = useAppSelector((state) => state.configuration.ace.keybinding);
+  const aceTheme = useAppSelector((state) => state.configuration.ace.theme);
+  const monacoTheme = useAppSelector((state) => state.configuration.monaco.theme);
+  const theme = useAppSelector((state) => state.configuration.theme);
+  const orientation = useAppSelector((state) => state.configuration.orientation);
+  const editorStyle = useAppSelector((state) => state.configuration.editor);
+  const pairCharacters = useAppSelector((state) => state.configuration.ace.pairCharacters);
+  const assemblyFlavor = useAppSelector((state) => state.configuration.assemblyFlavor);
+  const demangleAssembly = useAppSelector((state) => state.configuration.demangleAssembly);
+  const processAssembly = useAppSelector((state) => state.configuration.processAssembly);
 
-  const dispatch = useDispatch();
-  const changeAceTheme = useCallback((t: string) => dispatch(actions.changeAceTheme(t)), [dispatch]);
-  const changeMonacoTheme = useCallback((t: string) => dispatch(actions.changeMonacoTheme(t)), [dispatch]);
-  const changeKeybinding = useCallback((k: string) => dispatch(actions.changeKeybinding(k)), [dispatch]);
-  const changeOrientation = useCallback((o: Orientation) => dispatch(actions.changeOrientation(o)), [dispatch]);
-  const changeEditorStyle = useCallback((e: Editor) => dispatch(actions.changeEditor(e)), [dispatch]);
+  const dispatch = useAppDispatch();
+  const changeAceTheme = useCallback((t: string) => dispatch(config.changeAceTheme(t)), [dispatch]);
+  const changeMonacoTheme = useCallback((t: string) => dispatch(config.changeMonacoTheme(t)), [dispatch]);
+  const changeKeybinding = useCallback((k: string) => dispatch(config.changeKeybinding(k)), [dispatch]);
+  const changeTheme = useCallback((t: Theme) => dispatch(config.changeTheme(t)), [dispatch]);
+  const changeOrientation = useCallback((o: Orientation) => dispatch(config.changeOrientation(o)), [dispatch]);
+  const changeEditorStyle = useCallback((e: Editor) => dispatch(config.changeEditor(e)), [dispatch]);
   const changeAssemblyFlavor =
-    useCallback((a: AssemblyFlavor) => dispatch(actions.changeAssemblyFlavor(a)), [dispatch]);
+    useCallback((a: AssemblyFlavor) => dispatch(config.changeAssemblyFlavor(a)), [dispatch]);
   const changePairCharacters =
-    useCallback((p: PairCharacters) => dispatch(actions.changePairCharacters(p)), [dispatch]);
+    useCallback((p: PairCharacters) => dispatch(config.changePairCharacters(p)), [dispatch]);
   const changeProcessAssembly =
-    useCallback((p: ProcessAssembly) => dispatch(actions.changeProcessAssembly(p)), [dispatch]);
+    useCallback((p: ProcessAssembly) => dispatch(config.changeProcessAssembly(p)), [dispatch]);
   const changeDemangleAssembly =
-    useCallback((d: DemangleAssembly) => dispatch(actions.changeDemangleAssembly(d)), [dispatch]);
+    useCallback((d: DemangleAssembly) => dispatch(config.changeDemangleAssembly(d)), [dispatch]);
 
   return (
     <Fragment>
@@ -99,6 +101,12 @@ const ConfigMenu: React.FC = () => {
       </MenuGroup>
 
       <MenuGroup title="UI">
+        <SelectConfig name="Theme" value={theme} onChange={changeTheme}>
+          <option value={Theme.System}>System</option>
+          <option value={Theme.Light}>Light</option>
+          <option value={Theme.Dark}>Dark</option>
+        </SelectConfig>
+
         <SelectConfig
           name="Orientation"
           value={orientation}

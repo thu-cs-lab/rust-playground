@@ -1,13 +1,12 @@
 import React, { useCallback } from 'react';
 import root from 'react-shadow';
 
-import 'prismjs/components/prism-rust.min';
-import { PrismCode } from 'react-prism';
-
+import Prism from './Prism';
 import * as actions from './actions';
-import { useAppDispatch } from './configureStore';
+import { useAppDispatch } from './hooks';
 
-import styles from './HelpExample.module.css';
+import * as styles from './HelpExample.module.css';
+import prismOverrides from './prismjs-overrides.css';
 import prismTheme from 'prismjs/themes/prism-okaidia.css';
 
 export interface HelpExampleProps {
@@ -16,10 +15,7 @@ export interface HelpExampleProps {
 
 const HelpExample: React.FC<HelpExampleProps> = ({ code }) => {
   const dispatch = useAppDispatch();
-  const showExample = useCallback(
-    () => dispatch(actions.showExample(code)),
-    [dispatch, code]
-  );
+  const showExample = useCallback(() => dispatch(actions.showExample(code)), [dispatch, code]);
 
   return (
     <div className={styles.container}>
@@ -28,12 +24,9 @@ const HelpExample: React.FC<HelpExampleProps> = ({ code }) => {
       </button>
       <root.div>
         <link href={prismTheme} rel="stylesheet" />
+        <link href={prismOverrides} rel="stylesheet" />
 
-        <pre>
-          <PrismCode className="language-rust">
-            {code}
-          </PrismCode>
-        </pre>
+        <Prism language="rust">{code}</Prism>
       </root.div>
     </div>
   );

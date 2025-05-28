@@ -1,21 +1,20 @@
 import React, { useCallback } from 'react';
-import { useSelector, useDispatch } from 'react-redux';
 
-import * as actions from '../actions';
 import * as selectors from '../selectors';
-import { State } from '../reducers';
+import * as code from '../reducers/code';
+import { useAppDispatch, useAppSelector } from '../hooks';
 
 import Section from './Section';
 import SimplePane from './SimplePane';
 
-import styles from './Execute.module.css';
+import * as styles from './Execute.module.css';
 
 const Execute: React.FC = () => {
-  const details = useSelector((state: State) => state.output.execute);
-  const isAutoBuild = useSelector(selectors.isAutoBuildSelector);
+  const details = useAppSelector((state) => state.output.execute);
+  const isAutoBuild = useAppSelector(selectors.isAutoBuildSelector);
 
-  const dispatch = useDispatch();
-  const addMainFunction = useCallback(() => dispatch(actions.addMainFunction()), [dispatch]);
+  const dispatch = useAppDispatch();
+  const addMainFunction = useCallback(() => dispatch(code.addMainFunction()), [dispatch]);
 
   return (
     <SimplePane {...details} kind="execute">
@@ -25,7 +24,7 @@ const Execute: React.FC = () => {
 };
 
 interface WarningProps {
-  addMainFunction: () => any;
+  addMainFunction: () => void;
 }
 
 const Warning: React.FC<WarningProps> = props => (

@@ -42,15 +42,38 @@ RSpec.feature "Using third-party Rust tools", type: :feature, js: true do
     in_tools_menu { click_on("Miri") }
 
     within(:output, :stderr) do
-      expect(page).to have_content %r{alloc\d+ has size 0, so pointer to 1 byte starting at offset 0 is out-of-bounds}, wait: 10
+      expect(page).to have_content %r{using uninitialized data, but this operation requires initialized memory}, wait: 10
     end
   end
 
   def code_with_undefined_behavior
     <<~EOF
     fn main() {
-        let mut a: [u8; 0] = [];
-        unsafe { *a.get_unchecked_mut(1) = 1; }
+        unsafe { core::mem::MaybeUninit::<u8>::uninit().assume_init() };
+    }
+    EOF
+  end
+
+  scenario "configure Miri for tree borrows" do
+    editor.set code_valid_under_tree_borrows_but_not_stacked_borrows
+    in_advanced_options_menu { choose("tree") }
+    in_tools_menu { click_on("Miri") }
+
+    within(:output, :stdout) do
+      expect(page).to have_content %r{[1, 2]}, wait: 10
+    end
+
+    within(:output, :stderr) do
+      expect(page).to_not have_content %r{Undefined Behavior}
+    end
+  end
+
+  def code_valid_under_tree_borrows_but_not_stacked_borrows
+    <<~EOF
+    fn main() {
+        let val = [1u8, 2];
+        let ptr = &val[0] as *const u8;
+        let _val = unsafe { *ptr.add(1) };
     }
     EOF
   end

@@ -1,14 +1,14 @@
 use crate::{
     metrics::{self, record_metric, Endpoint, HasLabelsCore, Outcome},
+    request_database::Handle,
     server_axum::api_orchestrator_integration_impls::*,
-    Error, Result, StreamingCoordinatorExecuteStdinSnafu, StreamingCoordinatorIdleSnafu,
-    StreamingCoordinatorSpawnSnafu, StreamingExecuteSnafu, WebSocketTaskPanicSnafu,
+    WebSocketConfig,
 };
 
 use axum::extract::ws::{Message, WebSocket};
-use futures::{Future, FutureExt};
+use futures::{future::Fuse, Future, FutureExt, StreamExt, TryFutureExt};
 use orchestrator::{
-    coordinator::{self, Coordinator, DockerBackend},
+    coordinator::{self, Coordinator, CoordinatorFactory, DockerBackend},
     DropErrorDetailsExt,
 };
 use snafu::prelude::*;
@@ -16,6 +16,8 @@ use std::{
     collections::BTreeMap,
     convert::TryFrom,
     mem,
+    ops::ControlFlow,
+    pin::pin,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc,
@@ -27,8 +29,8 @@ use tokio::{
     task::{AbortHandle, JoinSet},
     time,
 };
-use tokio_util::sync::CancellationToken;
-use tracing::{error, instrument, warn, Instrument};
+use tokio_util::sync::{CancellationToken, DropGuard};
+use tracing::{error, info, instrument, warn, Instrument};
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -111,16 +113,16 @@ impl TryFrom<ExecuteRequest> for coordinator::ExecuteRequest {
 
 #[derive(Debug, Snafu)]
 pub(crate) enum ExecuteRequestParseError {
-    #[snafu(context(false))]
+    #[snafu(transparent)]
     Channel { source: ParseChannelError },
 
-    #[snafu(context(false))]
+    #[snafu(transparent)]
     CrateType { source: ParseCrateTypeError },
 
-    #[snafu(context(false))]
+    #[snafu(transparent)]
     Mode { source: ParseModeError },
 
-    #[snafu(context(false))]
+    #[snafu(transparent)]
     Edition { source: ParseEditionError },
 }
 
@@ -141,6 +143,9 @@ enum MessageResponse {
 
     #[serde(rename = "output/execute/wsExecuteStderr")]
     ExecuteStderr { payload: String, meta: Meta },
+
+    #[serde(rename = "output/execute/wsExecuteStatus")]
+    ExecuteStatus { payload: ExecuteStatus, meta: Meta },
 
     #[serde(rename = "output/execute/wsExecuteEnd")]
     ExecuteEnd {
@@ -167,13 +172,40 @@ impl From<crate::FeatureFlags> for FeatureFlags {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ExecuteStatus {
+    resident_set_size_bytes: u64,
+    total_time_secs: f64,
+}
+
+impl From<orchestrator::coordinator::ExecuteStatus> for ExecuteStatus {
+    fn from(value: orchestrator::coordinator::ExecuteStatus) -> Self {
+        let coordinator::ExecuteStatus {
+            resident_set_size_bytes,
+            total_time_secs,
+        } = value;
+
+        Self {
+            resident_set_size_bytes,
+            total_time_secs,
+        }
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ExecuteResponse {
     success: bool,
     exit_detail: String,
 }
 
 #[instrument(skip_all, fields(ws_id))]
-pub(crate) async fn handle(socket: WebSocket, feature_flags: FeatureFlags) {
+pub(crate) async fn handle(
+    socket: WebSocket,
+    config: WebSocketConfig,
+    factory: Arc<CoordinatorFactory>,
+    feature_flags: FeatureFlags,
+    db: Handle,
+) {
     static WEBSOCKET_ID: AtomicU64 = AtomicU64::new(0);
 
     metrics::LIVE_WS.inc();
@@ -181,15 +213,18 @@ pub(crate) async fn handle(socket: WebSocket, feature_flags: FeatureFlags) {
 
     let id = WEBSOCKET_ID.fetch_add(1, Ordering::SeqCst);
     tracing::Span::current().record("ws_id", &id);
+    info!("WebSocket started");
 
-    handle_core(socket, feature_flags).await;
+    handle_core(socket, config, factory, feature_flags, db).await;
 
+    info!("WebSocket ending");
     metrics::LIVE_WS.dec();
     let elapsed = start.elapsed();
     metrics::DURATION_WS.observe(elapsed.as_secs_f64());
 }
 
-type ResponseTx = mpsc::Sender<Result<MessageResponse>>;
+type TaggedError = (Error, Option<Meta>);
+type ResponseTx = mpsc::Sender<Result<MessageResponse, TaggedError>>;
 type SharedCoordinator = Arc<Coordinator<DockerBackend>>;
 
 /// Manages a limited amount of access to the `Coordinator`.
@@ -204,23 +239,20 @@ type SharedCoordinator = Arc<Coordinator<DockerBackend>>;
 /// - Allows limited parallelism between jobs of different types.
 struct CoordinatorManager {
     coordinator: SharedCoordinator,
-    tasks: JoinSet<Result<()>>,
+    tasks: JoinSet<Result<(), TaggedError>>,
     semaphore: Arc<Semaphore>,
     abort_handles: [Option<AbortHandle>; Self::N_KINDS],
 }
 
 impl CoordinatorManager {
-    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
-    const SESSION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
-
     const N_PARALLEL: usize = 2;
 
     const N_KINDS: usize = 1;
     const KIND_EXECUTE: usize = 0;
 
-    async fn new() -> Self {
+    fn new(factory: &CoordinatorFactory) -> Self {
         Self {
-            coordinator: Arc::new(Coordinator::new_docker().await),
+            coordinator: Arc::new(factory.build()),
             tasks: Default::default(),
             semaphore: Arc::new(Semaphore::new(Self::N_PARALLEL)),
             abort_handles: Default::default(),
@@ -231,7 +263,9 @@ impl CoordinatorManager {
         self.tasks.is_empty()
     }
 
-    async fn join_next(&mut self) -> Option<Result<Result<()>, tokio::task::JoinError>> {
+    async fn join_next(
+        &mut self,
+    ) -> Option<Result<Result<(), TaggedError>, tokio::task::JoinError>> {
         self.tasks.join_next().await
     }
 
@@ -239,7 +273,7 @@ impl CoordinatorManager {
     where
         F: FnOnce(SharedCoordinator) -> Fut,
         F: 'static + Send,
-        Fut: Future<Output = Result<()>>,
+        Fut: Future<Output = Result<(), TaggedError>>,
         Fut: 'static + Send,
     {
         let coordinator = self.coordinator.clone();
@@ -307,7 +341,13 @@ pub enum CoordinatorManagerError {
 
 type CoordinatorManagerResult<T, E = CoordinatorManagerError> = std::result::Result<T, E>;
 
-async fn handle_core(mut socket: WebSocket, feature_flags: FeatureFlags) {
+async fn handle_core(
+    mut socket: WebSocket,
+    config: WebSocketConfig,
+    factory: Arc<CoordinatorFactory>,
+    feature_flags: FeatureFlags,
+    db: Handle,
+) {
     if !connect_handshake(&mut socket).await {
         return;
     }
@@ -323,10 +363,9 @@ async fn handle_core(mut socket: WebSocket, feature_flags: FeatureFlags) {
         return;
     }
 
-    let mut manager = CoordinatorManager::new().await;
-    tokio::pin! {
-        let session_timeout = time::sleep(CoordinatorManager::SESSION_TIMEOUT);
-    }
+    let mut manager = CoordinatorManager::new(&factory);
+    let mut session_timeout = pin!(time::sleep(config.session_timeout));
+    let mut idle_timeout = pin!(Fuse::terminated());
 
     let mut active_executions = BTreeMap::new();
     let mut active_execution_gc_interval = time::interval(Duration::from_secs(30));
@@ -341,7 +380,7 @@ async fn handle_core(mut socket: WebSocket, feature_flags: FeatureFlags) {
                         // browser disconnected
                         break;
                     }
-                    Some(Ok(Message::Text(txt))) => handle_msg(txt, &tx, &mut manager, &mut active_executions).await,
+                    Some(Ok(Message::Text(txt))) => handle_msg(&txt, &tx, &mut manager, &mut active_executions, &db).await,
                     Some(Ok(_)) => {
                         // unknown message type
                         continue;
@@ -352,6 +391,7 @@ async fn handle_core(mut socket: WebSocket, feature_flags: FeatureFlags) {
 
             resp = rx.recv() => {
                 let resp = resp.expect("The rx should never close as we have a tx");
+
                 let success = resp.is_ok();
                 let resp = resp.unwrap_or_else(error_to_response);
                 let resp = response_to_message(resp);
@@ -367,7 +407,13 @@ async fn handle_core(mut socket: WebSocket, feature_flags: FeatureFlags) {
 
             // We don't care if there are no running tasks
             Some(task) = manager.join_next() => {
-                let error = match task {
+                // The last task has completed which means we are a
+                // candidate for idling in a little while.
+                if manager.is_empty() {
+                    idle_timeout.set(time::sleep(config.idle_timeout).fuse());
+                }
+
+                let (error, meta) = match task {
                     Ok(Ok(())) => continue,
                     Ok(Err(error)) => error,
                     Err(error) => {
@@ -381,11 +427,11 @@ async fn handle_core(mut socket: WebSocket, feature_flags: FeatureFlags) {
                                 _ => "An unknown panic occurred".into(),
                             }
                         };
-                        WebSocketTaskPanicSnafu { text }.build()
+                        (WebSocketTaskPanicSnafu { text }.build(), None)
                     }
                 };
 
-                if tx.send(Err(error)).await.is_err() {
+                if tx.send(Err((error, meta))).await.is_err() {
                     // We can't send a response
                     break;
                 }
@@ -394,18 +440,21 @@ async fn handle_core(mut socket: WebSocket, feature_flags: FeatureFlags) {
             _ = active_execution_gc_interval.tick() => {
                 active_executions = mem::take(&mut active_executions)
                     .into_iter()
-                    .filter(|(_id, (_, tx))| !tx.is_closed())
+                    .filter(|(_id, (_, tx))| tx.as_ref().map_or(false, |tx| !tx.is_closed()))
                     .collect();
             },
 
-            _ = time::sleep(CoordinatorManager::IDLE_TIMEOUT), if manager.is_empty() => {
-                let idled = manager.idle().await.context(StreamingCoordinatorIdleSnafu);
+            _ = &mut idle_timeout, if manager.is_empty() => {
+                if handle_idle(&mut manager, &tx).await.is_break() {
+                    break
+                }
+            },
 
-                let Err(error) = idled else { continue };
+            _ = factory.container_requested(), if manager.is_empty() => {
+                info!("Container requested to idle");
 
-                if tx.send(Err(error)).await.is_err() {
-                    // We can't send a response
-                    break;
+                if handle_idle(&mut manager, &tx).await.is_break() {
+                    break
                 }
             },
 
@@ -442,11 +491,14 @@ fn create_server_meta() -> Meta {
     })
 }
 
-fn error_to_response(error: Error) -> MessageResponse {
-    let error = error.to_string();
+fn error_to_response((error, meta): TaggedError) -> MessageResponse {
+    let error = snafu::CleanedErrorText::new(&error)
+        .map(|(_, t, _)| t)
+        .reduce(|e, t| e + ": " + &t)
+        .unwrap_or_default();
     let payload = WSError { error };
-    // TODO: thread through the Meta from the originating request
-    let meta = create_server_meta();
+
+    let meta = meta.unwrap_or_else(create_server_meta);
 
     MessageResponse::Error { payload, meta }
 }
@@ -455,45 +507,80 @@ fn response_to_message(response: MessageResponse) -> Message {
     const LAST_CHANCE_ERROR: &str =
         r#"{ "type": "WEBSOCKET_ERROR", "error": "Unable to serialize JSON" }"#;
     let resp = serde_json::to_string(&response).unwrap_or_else(|_| LAST_CHANCE_ERROR.into());
-    Message::Text(resp)
+    Message::Text(resp.into())
 }
 
+async fn handle_idle(manager: &mut CoordinatorManager, tx: &ResponseTx) -> ControlFlow<()> {
+    let idled = manager.idle().await.context(StreamingCoordinatorIdleSnafu);
+
+    let Err(error) = idled else {
+        return ControlFlow::Continue(());
+    };
+
+    if tx.send(Err((error, None))).await.is_err() {
+        // We can't send a response
+        return ControlFlow::Break(());
+    }
+
+    ControlFlow::Continue(())
+}
+
+type ActiveExecutionInfo = (DropGuard, Option<mpsc::Sender<String>>);
+
 async fn handle_msg(
-    txt: String,
+    txt: &str,
     tx: &ResponseTx,
     manager: &mut CoordinatorManager,
-    active_executions: &mut BTreeMap<i64, (CancellationToken, mpsc::Sender<String>)>,
+    active_executions: &mut BTreeMap<i64, ActiveExecutionInfo>,
+    db: &Handle,
 ) {
     use WSMessageRequest::*;
 
-    let msg = serde_json::from_str(&txt).context(crate::DeserializationSnafu);
+    let msg = serde_json::from_str(txt).context(DeserializationSnafu);
 
     match msg {
         Ok(ExecuteRequest { payload, meta }) => {
             let token = CancellationToken::new();
             let (execution_tx, execution_rx) = mpsc::channel(8);
 
-            active_executions.insert(meta.sequence_number, (token.clone(), execution_tx));
+            let guard = db.clone().start_with_guard("ws.Execute", txt).await;
+
+            active_executions.insert(
+                meta.sequence_number,
+                (token.clone().drop_guard(), Some(execution_tx)),
+            );
 
             // TODO: Should a single execute / build / etc. session have a timeout of some kind?
             let spawned = manager
                 .spawn({
                     let tx = tx.clone();
-                    |coordinator| {
-                        handle_execute(token, execution_rx, tx, coordinator, payload, meta)
-                            .context(StreamingExecuteSnafu)
+                    let meta = meta.clone();
+                    |coordinator| async {
+                        let r = handle_execute(
+                            token,
+                            execution_rx,
+                            tx,
+                            coordinator,
+                            payload,
+                            meta.clone(),
+                        )
+                        .context(StreamingExecuteSnafu)
+                        .map_err(|e| (e, Some(meta)))
+                        .await;
+
+                        guard.complete_now(r)
                     }
                 })
                 .await
                 .context(StreamingCoordinatorSpawnSnafu);
 
             if let Err(e) = spawned {
-                tx.send(Err(e)).await.ok(/* We don't care if the channel is closed */);
+                tx.send(Err((e, Some(meta)))).await.ok(/* We don't care if the channel is closed */);
             }
         }
 
         Ok(ExecuteStdin { payload, meta }) => {
-            let Some((_, execution_tx)) = active_executions.get(&meta.sequence_number) else {
+            let Some((_, Some(execution_tx))) = active_executions.get(&meta.sequence_number) else {
                 warn!("Received stdin for an execution that is no longer active");
                 return;
             };
@@ -504,23 +591,29 @@ async fn handle_msg(
                 .context(StreamingCoordinatorExecuteStdinSnafu);
 
             if let Err(e) = sent {
-                tx.send(Err(e)).await.ok(/* We don't care if the channel is closed */);
+                tx.send(Err((e, Some(meta)))).await.ok(/* We don't care if the channel is closed */);
             }
         }
 
         Ok(ExecuteStdinClose { meta }) => {
-            let execution_tx = active_executions.remove(&meta.sequence_number);
-            drop(execution_tx); // Signal closed
+            let Some((_, execution_tx)) = active_executions.get_mut(&meta.sequence_number) else {
+                warn!("Received stdin close for an execution that is no longer active");
+                return;
+            };
+
+            *execution_tx = None; // Drop to signal closed
         }
 
         Ok(ExecuteKill { meta }) => {
-            if let Some((token, _)) = active_executions.remove(&meta.sequence_number) {
-                token.cancel();
-            }
+            let Some((token, _)) = active_executions.remove(&meta.sequence_number) else {
+                warn!("Received kill for an execution that is no longer active");
+                return;
+            };
+            drop(token);
         }
 
         Err(e) => {
-            tx.send(Err(e)).await.ok(/* We don't care if the channel is closed */);
+            tx.send(Err((e, None))).await.ok(/* We don't care if the channel is closed */);
         }
     }
 }
@@ -582,12 +675,14 @@ async fn handle_execute_inner(
     use CompletedOrAbandoned::*;
 
     let coordinator::ActiveExecution {
+        permit: _permit,
         mut task,
         stdin_tx,
         mut stdout_rx,
         mut stderr_rx,
+        mut status_rx,
     } = coordinator
-        .begin_execute(token.clone(), req)
+        .begin_execute(token.clone(), req.clone())
         .await
         .context(BeginSnafu)?;
 
@@ -609,6 +704,8 @@ async fn handle_execute_inner(
         tx.send(Ok(MessageResponse::ExecuteStderr { payload, meta }))
             .await
     };
+
+    let mut reported = false;
 
     let status = loop {
         tokio::select! {
@@ -641,6 +738,18 @@ async fn handle_execute_inner(
                 let sent = send_stderr(stderr).await;
                 abandon_if_closed!(sent);
             },
+
+            Some(status) = status_rx.next() => {
+                if !reported && status.total_time_secs > 60.0 {
+                    error!("Request consumed more than 60s of CPU time: {req:?}");
+                    reported = true;
+                }
+
+                let payload = status.into();
+                let meta = meta.clone();
+                let sent = tx.send(Ok(MessageResponse::ExecuteStatus { payload, meta })).await;
+                abandon_if_closed!(sent);
+            }
         }
     };
 
@@ -696,3 +805,26 @@ pub(crate) enum ExecuteError {
 }
 
 type ExecuteResult<T, E = ExecuteError> = std::result::Result<T, E>;
+
+#[derive(Debug, Snafu)]
+enum Error {
+    #[snafu(display("Unable to deserialize request"))]
+    Deserialization { source: serde_json::Error },
+
+    #[snafu(display("The WebSocket worker panicked: {}", text))]
+    WebSocketTaskPanic { text: String },
+
+    #[snafu(display("Unable to spawn a coordinator task"))]
+    StreamingCoordinatorSpawn { source: CoordinatorManagerError },
+
+    #[snafu(display("Unable to idle the coordinator"))]
+    StreamingCoordinatorIdle { source: CoordinatorManagerError },
+
+    #[snafu(display("Unable to perform a streaming execute"))]
+    StreamingExecute { source: ExecuteError },
+
+    #[snafu(display("Unable to pass stdin to the active execution"))]
+    StreamingCoordinatorExecuteStdin {
+        source: tokio::sync::mpsc::error::SendError<()>,
+    },
+}

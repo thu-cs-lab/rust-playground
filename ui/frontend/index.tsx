@@ -9,24 +9,25 @@ import { Provider } from 'react-redux';
 import { v4 } from 'uuid';
 
 import {
-  editCode,
-  enableFeatureGate,
-  gotoPosition,
-  selectText,
-  addImport,
-  performCratesLoad,
-  performVersionsLoad,
   reExecuteWithBacktrace,
-  browserWidthChanged,
 } from './actions';
 import { configureRustErrors } from './highlighting';
 import PageSwitcher from './PageSwitcher';
 import playgroundApp from './reducers';
 import { clientSetIdentifiers } from './reducers/client';
 import { featureFlagsForceDisableAll, featureFlagsForceEnableAll } from './reducers/featureFlags';
-import { disableSyncChangesToStorage } from './reducers/globalConfiguration';
+import { disableSyncChangesToStorage, override } from './reducers/globalConfiguration';
 import Router from './Router';
 import configureStore from './configureStore';
+import { performVersionsLoad } from './reducers/versions';
+import { performCratesLoad } from './reducers/crates';
+import { gotoPosition } from './reducers/position';
+import { addImport, editCode, enableFeatureGate } from './reducers/code';
+import { browserWidthChanged } from './reducers/browser';
+import { selectText } from './reducers/selection';
+import { useAppSelector } from './hooks';
+import { themeSelector } from './selectors';
+import { Theme } from './types';
 
 const store = configureStore(window);
 
@@ -51,6 +52,10 @@ if (params.has('features')) {
     store.dispatch(featureFlagsForceEnableAll());
   }
 }
+const configOverrides = params.get('whte_rbt.obj');
+if (configOverrides) {
+  store.dispatch(override(configOverrides));
+}
 
 const whenBrowserWidthChanged = (evt: MediaQueryList | MediaQueryListEvent) =>
   store.dispatch(browserWidthChanged(evt.matches));
@@ -61,7 +66,7 @@ maxWidthMediaQuery.addEventListener('change', whenBrowserWidthChanged);
 
 configureRustErrors({
   enableFeatureGate: featureGate => store.dispatch(enableFeatureGate(featureGate)),
-  gotoPosition: (line, col) => store.dispatch(gotoPosition(line, col)),
+  gotoPosition: (p) => store.dispatch(gotoPosition(p)),
   selectText: (start, end) => store.dispatch(selectText(start, end)),
   addImport: (code) => store.dispatch(addImport(code)),
   reExecuteWithBacktrace: () => store.dispatch(reExecuteWithBacktrace()),
@@ -80,13 +85,28 @@ window.rustPlayground = {
   },
 };
 
+const ThemeProvider: React.FC<React.PropsWithChildren> = ({ children }) => {
+  const theme = useAppSelector(themeSelector);
+  React.useEffect(() => {
+    if (theme === Theme.System) {
+      delete document.documentElement.dataset['theme'];
+    } else {
+      document.documentElement.dataset['theme'] = theme;
+    }
+  }, [theme]);
+
+  return <>{children}</>;
+};
+
 const container = document.getElementById('playground');
 if (container) {
   const root = createRoot(container);
   root.render(
     <Provider store={store}>
       <Router store={store} reducer={playgroundApp}>
-        <PageSwitcher />
+        <ThemeProvider>
+          <PageSwitcher />
+        </ThemeProvider>
       </Router>
     </Provider>,
   );

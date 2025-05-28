@@ -1,55 +1,80 @@
-use futures::future::BoxFuture;
-use lazy_static::lazy_static;
-use orchestrator::coordinator;
+use orchestrator::coordinator::{self, Channel, CompileTarget, CrateType, Edition, Mode};
 use prometheus::{
-    self, register_histogram, register_histogram_vec, register_int_counter,
-    register_int_counter_vec, register_int_gauge, Histogram, HistogramVec, IntCounter,
-    IntCounterVec, IntGauge,
+    register_histogram, register_histogram_vec, register_int_counter, register_int_counter_vec,
+    register_int_gauge, Histogram, HistogramVec, IntCounter, IntCounterVec, IntGauge,
 };
-use regex::Regex;
 use std::{
     future::Future,
+    sync::LazyLock,
     time::{Duration, Instant},
 };
 
-use crate::sandbox::{self, Channel, CompileTarget, CrateType, Edition, Mode};
-
-lazy_static! {
-    pub(crate) static ref REQUESTS: HistogramVec = register_histogram_vec!(
+pub(crate) static REQUESTS: LazyLock<HistogramVec> = LazyLock::new(|| {
+    register_histogram_vec!(
         "playground_request_duration_seconds",
         "Number of requests made",
         Labels::LABELS,
         vec![0.1, 1.0, 2.5, 5.0, 10.0, 15.0]
     )
-    .unwrap();
-    pub(crate) static ref LIVE_WS: IntGauge = register_int_gauge!(
+    .unwrap()
+});
+pub(crate) static LIVE_WS: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
         "playground_active_websocket_connections_count",
         "Number of active WebSocket connections"
     )
-    .unwrap();
-    pub(crate) static ref DURATION_WS: Histogram = register_histogram!(
+    .unwrap()
+});
+pub(crate) static DURATION_WS: LazyLock<Histogram> = LazyLock::new(|| {
+    register_histogram!(
         "playground_websocket_duration_seconds",
         "WebSocket connection length",
         vec![15.0, 60.0, 300.0, 600.0, 1800.0, 3600.0, 7200.0]
     )
-    .unwrap();
-    pub(crate) static ref UNAVAILABLE_WS: IntCounter = register_int_counter!(
+    .unwrap()
+});
+pub(crate) static UNAVAILABLE_WS: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "playground_websocket_unavailability_count",
         "Number of failed WebSocket connections"
     )
-    .unwrap();
-    pub(crate) static ref WS_INCOMING: IntCounter = register_int_counter!(
+    .unwrap()
+});
+pub(crate) static WS_INCOMING: LazyLock<IntCounter> = LazyLock::new(|| {
+    register_int_counter!(
         "playground_websocket_incoming_messages_count",
         "Number of WebSocket messages received"
     )
-    .unwrap();
-    pub(crate) static ref WS_OUTGOING: IntCounterVec = register_int_counter_vec!(
+    .unwrap()
+});
+pub(crate) static WS_OUTGOING: LazyLock<IntCounterVec> = LazyLock::new(|| {
+    register_int_counter_vec!(
         "playground_websocket_outgoing_messages_count",
         "Number of WebSocket messages sent",
         &["success"],
     )
-    .unwrap();
-}
+    .unwrap()
+});
+pub(crate) static CONTAINER_QUEUE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "playground_container_queue",
+        "Number of waiters for a container"
+    )
+    .unwrap()
+});
+pub(crate) static CONTAINER_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("playground_container_active", "Number of active containers").unwrap()
+});
+pub(crate) static PROCESS_QUEUE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "playground_process_queue",
+        "Number of waiters for a process"
+    )
+    .unwrap()
+});
+pub(crate) static PROCESS_ACTIVE: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!("playground_process_active", "Number of active processs").unwrap()
+});
 
 #[derive(Debug, Copy, Clone, strum::IntoStaticStr)]
 pub(crate) enum Endpoint {
@@ -60,12 +85,7 @@ pub(crate) enum Endpoint {
     Clippy,
     MacroExpansion,
     MetaCrates,
-    MetaVersionStable,
-    MetaVersionBeta,
-    MetaVersionNightly,
-    MetaVersionRustfmt,
-    MetaVersionClippy,
-    MetaVersionMiri,
+    MetaVersions,
     Evaluate,
 }
 
@@ -74,7 +94,6 @@ pub(crate) enum Outcome {
     Success,
     ErrorServer,
     ErrorTimeoutSoft,
-    ErrorTimeoutHard,
     ErrorUserCode,
     Abandoned,
 }
@@ -135,15 +154,38 @@ impl Labels {
             v.map_or("", |v| if v { "true" } else { "false" })
         }
 
-        let target = target.map_or("", Into::into);
-        let channel = channel.map_or("", Into::into);
-        let mode = mode.map_or("", Into::into);
+        let target = match target {
+            Some(CompileTarget::Assembly(_, _, _)) => "Assembly",
+            Some(CompileTarget::Hir) => "Hir",
+            Some(CompileTarget::LlvmIr) => "LlvmIr",
+            Some(CompileTarget::Mir) => "Mir",
+            Some(CompileTarget::Wasm) => "Wasm",
+            None => "",
+        };
+        let channel = match channel {
+            Some(Channel::Stable) => "Stable",
+            Some(Channel::Beta) => "Beta",
+            Some(Channel::Nightly) => "Nightly",
+            None => "",
+        };
+        let mode = match mode {
+            Some(Mode::Debug) => "Debug",
+            Some(Mode::Release) => "Release",
+            None => "",
+        };
         let edition = match edition {
             None => "",
             Some(None) => "Unspecified",
-            Some(Some(v)) => v.into(),
+            Some(Some(Edition::Rust2015)) => "Rust2015",
+            Some(Some(Edition::Rust2018)) => "Rust2018",
+            Some(Some(Edition::Rust2021)) => "Rust2021",
+            Some(Some(Edition::Rust2024)) => "Rust2024",
         };
-        let crate_type = crate_type.map_or("", Into::into);
+        let crate_type = match crate_type {
+            Some(CrateType::Binary) => "Binary",
+            Some(CrateType::Library(_)) => "Library",
+            None => "",
+        };
         let tests = b(tests);
         let backtrace = b(backtrace);
 
@@ -184,157 +226,13 @@ impl Labels {
     }
 }
 
-pub(crate) trait GenerateLabels {
-    fn generate_labels(&self, outcome: Outcome) -> Labels;
-}
-
-impl<T> GenerateLabels for &'_ T
-where
-    T: GenerateLabels,
-{
-    fn generate_labels(&self, outcome: Outcome) -> Labels {
-        T::generate_labels(self, outcome)
-    }
-}
-
-impl GenerateLabels for sandbox::MiriRequest {
-    fn generate_labels(&self, outcome: Outcome) -> Labels {
-        let Self { code: _, edition } = *self;
-
-        Labels {
-            endpoint: Endpoint::Miri,
-            outcome,
-
-            target: None,
-            channel: None,
-            mode: None,
-            edition: Some(edition),
-            crate_type: None,
-            tests: None,
-            backtrace: None,
-        }
-    }
-}
-
-impl GenerateLabels for sandbox::MacroExpansionRequest {
-    fn generate_labels(&self, outcome: Outcome) -> Labels {
-        let Self { code: _, edition } = *self;
-
-        Labels {
-            endpoint: Endpoint::MacroExpansion,
-            outcome,
-
-            target: None,
-            channel: None,
-            mode: None,
-            edition: Some(edition),
-            crate_type: None,
-            tests: None,
-            backtrace: None,
-        }
-    }
-}
-
-pub(crate) trait SuccessDetails: Sized {
-    fn success_details(&self) -> Outcome;
-
-    fn for_sandbox_result(r: &Result<Self, sandbox::Error>) -> Outcome {
-        use sandbox::Error::*;
-
-        match r {
-            Ok(v) => v.success_details(),
-            Err(CompilerExecutionTimedOut { .. }) => Outcome::ErrorTimeoutHard,
-            Err(_) => Outcome::ErrorServer,
-        }
-    }
-}
-
-fn common_success_details(success: bool, stderr: &str) -> Outcome {
-    lazy_static! {
-        // Memory allocation failures are "Aborted"
-        static ref SOFT_TIMEOUT_REGEX: Regex = Regex::new("entrypoint.sh.*Killed.*timeout").unwrap();
-    }
-
-    match success {
-        true => Outcome::Success,
-        false => {
-            if stderr
-                .lines()
-                .next_back()
-                .map_or(false, |l| SOFT_TIMEOUT_REGEX.is_match(l))
-            {
-                Outcome::ErrorTimeoutSoft
-            } else {
-                Outcome::ErrorUserCode
-            }
-        }
-    }
-}
-
-impl SuccessDetails for sandbox::MiriResponse {
-    fn success_details(&self) -> Outcome {
-        common_success_details(self.success, &self.stderr)
-    }
-}
-
-impl SuccessDetails for sandbox::MacroExpansionResponse {
-    fn success_details(&self) -> Outcome {
-        common_success_details(self.success, &self.stderr)
-    }
-}
-
-impl SuccessDetails for Vec<sandbox::CrateInformation> {
-    fn success_details(&self) -> Outcome {
-        Outcome::Success
-    }
-}
-
-impl SuccessDetails for sandbox::Version {
-    fn success_details(&self) -> Outcome {
-        Outcome::Success
-    }
-}
-
-pub(crate) async fn track_metric_async<Req, B, Resp>(request: Req, body: B) -> sandbox::Result<Resp>
-where
-    Req: GenerateLabels,
-    for<'req> B: FnOnce(&'req Req) -> BoxFuture<'req, sandbox::Result<Resp>>,
-    Resp: SuccessDetails,
-{
-    track_metric_common_async(request, body, |_| {}).await
-}
-
-async fn track_metric_common_async<Req, B, Resp, F>(
-    request: Req,
-    body: B,
-    f: F,
-) -> sandbox::Result<Resp>
-where
-    Req: GenerateLabels,
-    for<'req> B: FnOnce(&'req Req) -> BoxFuture<'req, sandbox::Result<Resp>>,
-    Resp: SuccessDetails,
-    F: FnOnce(&mut Labels),
-{
-    let start = Instant::now();
-    let response = body(&request).await;
-    let elapsed = start.elapsed();
-
-    let outcome = SuccessDetails::for_sandbox_result(&response);
-    let mut labels = request.generate_labels(outcome);
-    f(&mut labels);
-
-    record_metric_complete(labels, elapsed);
-
-    response
-}
-
-pub(crate) async fn track_metric_no_request_async<B, Fut, Resp>(
+pub(crate) async fn track_metric_no_request_async<B, Fut, Resp, E>(
     endpoint: Endpoint,
     body: B,
-) -> crate::Result<Resp>
+) -> Result<Resp, E>
 where
     B: FnOnce() -> Fut,
-    Fut: Future<Output = crate::Result<Resp>>,
+    Fut: Future<Output = Result<Resp, E>>,
 {
     let start = Instant::now();
     let response = body().await;
@@ -380,11 +278,11 @@ impl HasLabelsCore for coordinator::CompileRequest {
         } = *self;
 
         LabelsCore {
-            target: Some(target.into()),
-            channel: Some(channel.into()),
-            mode: Some(mode.into()),
-            edition: Some(Some(edition.into())),
-            crate_type: Some(crate_type.into()),
+            target: Some(target),
+            channel: Some(channel),
+            mode: Some(mode),
+            edition: Some(Some(edition)),
+            crate_type: Some(crate_type),
             tests: Some(tests),
             backtrace: Some(backtrace),
         }
@@ -405,10 +303,10 @@ impl HasLabelsCore for coordinator::ExecuteRequest {
 
         LabelsCore {
             target: None,
-            channel: Some(channel.into()),
-            mode: Some(mode.into()),
-            edition: Some(Some(edition.into())),
-            crate_type: Some(crate_type.into()),
+            channel: Some(channel),
+            mode: Some(mode),
+            edition: Some(Some(edition)),
+            crate_type: Some(crate_type),
             tests: Some(tests),
             backtrace: Some(backtrace),
         }
@@ -426,10 +324,10 @@ impl HasLabelsCore for coordinator::FormatRequest {
 
         LabelsCore {
             target: None,
-            channel: Some(channel.into()),
+            channel: Some(channel),
             mode: None,
-            edition: Some(Some(edition.into())),
-            crate_type: Some(crate_type.into()),
+            edition: Some(Some(edition)),
+            crate_type: Some(crate_type),
             tests: None,
             backtrace: None,
         }
@@ -447,10 +345,54 @@ impl HasLabelsCore for coordinator::ClippyRequest {
 
         LabelsCore {
             target: None,
-            channel: Some(channel.into()),
+            channel: Some(channel),
             mode: None,
-            edition: Some(Some(edition.into())),
-            crate_type: Some(crate_type.into()),
+            edition: Some(Some(edition)),
+            crate_type: Some(crate_type),
+            tests: None,
+            backtrace: None,
+        }
+    }
+}
+
+impl HasLabelsCore for coordinator::MiriRequest {
+    fn labels_core(&self) -> LabelsCore {
+        let Self {
+            channel,
+            crate_type,
+            edition,
+            tests,
+            aliasing_model: _,
+            code: _,
+        } = *self;
+
+        LabelsCore {
+            target: None,
+            channel: Some(channel),
+            mode: None,
+            edition: Some(Some(edition)),
+            crate_type: Some(crate_type),
+            tests: Some(tests),
+            backtrace: None,
+        }
+    }
+}
+
+impl HasLabelsCore for coordinator::MacroExpansionRequest {
+    fn labels_core(&self) -> LabelsCore {
+        let Self {
+            channel,
+            crate_type,
+            edition,
+            code: _,
+        } = *self;
+
+        LabelsCore {
+            target: None,
+            channel: Some(channel),
+            mode: None,
+            edition: Some(Some(edition)),
+            crate_type: Some(crate_type),
             tests: None,
             backtrace: None,
         }

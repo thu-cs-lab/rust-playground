@@ -1,8 +1,6 @@
 import React, { useCallback } from 'react';
-import { useSelector, useDispatch } from 'react-redux';
 
 import { changeFocus } from './reducers/output/meta';
-import { State } from './reducers';
 import { Focus } from './types';
 
 import Execute from './Output/Execute';
@@ -11,8 +9,9 @@ import Section from './Output/Section';
 import SimplePane, { SimplePaneProps } from './Output/SimplePane';
 import PaneWithMir from './Output/PaneWithMir';
 import * as selectors from './selectors';
+import { useAppDispatch, useAppSelector } from './hooks';
 
-import styles from './Output.module.css';
+import * as styles from './Output.module.css';
 import Stdin from './Stdin';
 
 const Tab: React.FC<TabProps> = ({ kind, focus, label, onClick, tabProps }) => {
@@ -32,7 +31,7 @@ interface TabProps {
   kind: Focus;
   focus?: Focus;
   label: string;
-  onClick: () => any;
+  onClick: () => void;
   tabProps: object;
 }
 
@@ -47,11 +46,11 @@ interface PaneWithCodeProps extends SimplePaneProps {
 }
 
 const Output: React.FC = () => {
-  const somethingToShow = useSelector(selectors.getSomethingToShow);
+  const somethingToShow = useAppSelector(selectors.getSomethingToShow);
   const { meta: { focus }, execute, format, clippy, miri, macroExpansion, assembly, llvmIr, mir, hir, wasm, gist } =
-    useSelector((state: State) => state.output);
+    useAppSelector((state) => state.output);
 
-  const dispatch = useDispatch();
+  const dispatch = useAppDispatch();
   const focusClose = useCallback(() => dispatch(changeFocus()), [dispatch]);
   const focusExecute = useCallback(() => dispatch(changeFocus(Focus.Execute)), [dispatch]);
   const focusFormat = useCallback(() => dispatch(changeFocus(Focus.Format)), [dispatch]);
@@ -65,7 +64,7 @@ const Output: React.FC = () => {
   const focusWasm = useCallback(() => dispatch(changeFocus(Focus.Wasm)), [dispatch]);
   const focusGist = useCallback(() => dispatch(changeFocus(Focus.Gist)), [dispatch]);
 
-  const showStdin = useSelector(selectors.showStdinSelector);
+  const showStdin = useAppSelector(selectors.showStdinSelector);
 
   if (!somethingToShow) {
     return null;

@@ -2,9 +2,9 @@
 // preserved between completely independent sessions of the
 // playground.
 
-import State from './state';
+import { State } from './reducers';
 import {removeVersion, initializeStorage, PartialState} from './storage';
-import { AssemblyFlavor, DemangleAssembly, Editor, Orientation, PairCharacters, ProcessAssembly } from './types';
+import { AssemblyFlavor, DemangleAssembly, Editor, Orientation, PairCharacters, ProcessAssembly, Theme } from './types';
 import { codeSelector } from './selectors';
 
 const CURRENT_VERSION = 2;
@@ -25,13 +25,14 @@ interface V2Configuration {
     monaco: {
       theme: string;
     };
+    theme: Theme;
     orientation: Orientation;
     assemblyFlavor: AssemblyFlavor;
     demangleAssembly: DemangleAssembly;
     processAssembly: ProcessAssembly;
   };
   code: string;
-  notifications: any;
+  notifications: object;
 }
 
 interface V1Configuration {
@@ -47,7 +48,7 @@ interface V1Configuration {
     processAssembly: ProcessAssembly;
   };
   code: string;
-  notifications: any;
+  notifications: object;
 }
 
 type CurrentConfiguration = V2Configuration;
@@ -70,6 +71,7 @@ export function serialize(state: State): string {
       monaco: {
         theme: state.configuration.monaco.theme,
       },
+      theme: state.configuration.theme,
       orientation: state.configuration.orientation,
       assemblyFlavor: state.configuration.assemblyFlavor,
       demangleAssembly: state.configuration.demangleAssembly,
@@ -92,7 +94,8 @@ function migrateV1(state: V1Configuration): CurrentConfiguration {
     configuration: {
       ...configuration,
       ace: { theme, keybinding, pairCharacters },
-      monaco: { theme: 'vscode-dark-plus' },
+      monaco: { theme: 'vs-dark' },
+      theme: Theme.System,
       editor: editor === 'advanced' ? Editor.Ace : Editor.Simple,
     },
     version: 2,

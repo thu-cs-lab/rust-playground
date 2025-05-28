@@ -1,9 +1,14 @@
 declare module '*.module.css' {
   const classes: { [key: string]: string };
-  export default classes;
+  export = classes;
 }
 
 declare module 'prismjs/themes/*.css' {
+  const content: string;
+  export default content;
+}
+
+declare module '*prismjs-overrides.css' {
   const content: string;
   export default content;
 }

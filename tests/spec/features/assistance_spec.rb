@@ -1,11 +1,15 @@
 require 'spec_helper'
 require 'support/editor'
+require 'support/notifications'
 require 'support/playground_actions'
 
 RSpec.feature "Editor assistance for common code modifications", type: :feature, js: true do
   include PlaygroundActions
 
-  before { visit '/' }
+  before do
+    visit '/'
+    Notifications.new(page).close_all
+  end
 
   scenario "building code without a main method offers adding one" do
     editor.set <<~EOF
@@ -41,10 +45,10 @@ RSpec.feature "Editor assistance for common code modifications", type: :feature,
     click_on("Build")
 
     within(:output, :stderr) do
-      click_on("use core::num::NonZeroU128;")
+      click_on("use std::num::NonZeroU128;")
     end
 
-    expect(editor).to have_line 'use core::num::NonZeroU128;'
+    expect(editor).to have_line 'use std::num::NonZeroU128;'
   end
 
   scenario "triggering a panic offers enabling backtraces" do

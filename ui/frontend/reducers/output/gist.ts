@@ -1,10 +1,16 @@
-import { Draft, PayloadAction, createAsyncThunk, createSlice } from '@reduxjs/toolkit';
+import {
+  Draft,
+  PayloadAction,
+  SerializedError,
+  createAsyncThunk,
+  createSlice,
+} from '@reduxjs/toolkit';
+import * as z from 'zod';
 
-import { jsonGet, jsonPost, routes } from '../../actions';
+import { jsonGet, jsonPost, routes } from '../../api';
+import { State as RootState } from '../../reducers';
 import { baseUrlSelector, codeSelector } from '../../selectors';
-import RootState from '../../state';
 import { Channel, Edition, Mode } from '../../types';
-import { RequestsInProgress } from './sharedStateManagement';
 
 const sliceName = 'output/gist';
 
@@ -12,7 +18,8 @@ const initialState: State = {
   requestsInProgress: 0,
 };
 
-interface State extends RequestsInProgress {
+interface State {
+  requestsInProgress: number;
   id?: string;
   url?: string;
   code?: string;
@@ -21,6 +28,7 @@ interface State extends RequestsInProgress {
   channel?: Channel;
   mode?: Mode;
   edition?: Edition;
+  error?: string;
 }
 
 interface SuccessProps {
@@ -39,11 +47,12 @@ type PerformGistLoadProps = Pick<
   Exclude<keyof SuccessProps, 'url' | 'code' | 'stdout' | 'stderr'>
 >;
 
-interface GistResponseBody {
-  id: string;
-  url: string;
-  code: string;
-}
+const GistResponseBody = z.object({
+  id: z.string(),
+  url: z.string(),
+  code: z.string(),
+});
+type GistResponseBody = z.infer<typeof GistResponseBody>;
 
 export const performGistLoad = createAsyncThunk<
   SuccessProps,
@@ -55,8 +64,9 @@ export const performGistLoad = createAsyncThunk<
   const gistUrl = new URL(routes.meta.gistLoad, baseUrl);
   const u = new URL(id, gistUrl);
 
-  const gist = await jsonGet(u);
-  return { channel, mode, edition, ...gist };
+  const d = await jsonGet(u);
+  const gist = await GistResponseBody.parseAsync(d);
+  return { ...gist, channel, mode, edition, stdout: '', stderr: '' };
 });
 
 export const performGistSave = createAsyncThunk<SuccessProps, void, { state: RootState }>(
@@ -71,18 +81,28 @@ export const performGistSave = createAsyncThunk<SuccessProps, void, { state: Roo
       },
     } = state;
 
-    const json = await jsonPost<GistResponseBody>(routes.meta.gistSave, { code });
-    return { ...json, code, stdout, stderr, channel, mode, edition };
+    const d = await jsonPost(routes.meta.gistSave, { code });
+    const gist = await GistResponseBody.parseAsync(d);
+    return { ...gist, code, stdout, stderr, channel, mode, edition };
   },
 );
 
 const pending = (state: Draft<State>) => {
+  delete state.error;
   state.requestsInProgress += 1;
 };
 
 const fulfilled = (state: Draft<State>, action: PayloadAction<SuccessProps>) => {
   state.requestsInProgress -= 1;
   Object.assign(state, action.payload);
+};
+
+const rejected = (
+  state: Draft<State>,
+  action: PayloadAction<unknown, string, unknown, SerializedError>,
+) => {
+  state.requestsInProgress -= 1;
+  state.error = action.error.message;
 };
 
 const slice = createSlice({
@@ -93,8 +113,10 @@ const slice = createSlice({
     builder
       .addCase(performGistLoad.pending, pending)
       .addCase(performGistLoad.fulfilled, fulfilled)
+      .addCase(performGistLoad.rejected, rejected)
       .addCase(performGistSave.pending, pending)
-      .addCase(performGistSave.fulfilled, fulfilled);
+      .addCase(performGistSave.fulfilled, fulfilled)
+      .addCase(performGistSave.rejected, rejected);
   },
 });
 
