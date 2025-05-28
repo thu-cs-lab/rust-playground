@@ -40,6 +40,9 @@ type ErrorResponse = z.infer<typeof ErrorResponse>;
 async function fetchJson(url: FetchArg, args: RequestInit) {
   const headers = new Headers(args.headers);
   headers.set('Content-Type', 'application/json');
+  if (typeof url === "string") {
+    url = process.env.PUBLIC_URL + url;
+  }
 
   const response = await fetch(url, { ...args, headers });
   const body = await response.json();
