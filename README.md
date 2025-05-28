@@ -25,7 +25,7 @@ cd compiler
 cd ../ui
 cargo build --release
 cd frontend
-PUBLIC_URL=/rust yarn build
+PUBLIC_URL=/rust pnpm build
 ```
 
 3. Run playground backend as systemd service:
