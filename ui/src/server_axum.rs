@@ -43,7 +43,7 @@ use tower_http::{
     set_header::SetResponseHeader,
     trace::TraceLayer,
 };
-use tracing::{info, error, error_span, field};
+use tracing::{error, error_span, field, info};
 
 use crate::{env::PLAYGROUND_GITHUB_TOKEN, public_http_api as api};
 
@@ -100,17 +100,17 @@ pub(crate) async fn serve(config: Config) {
         .route(&transform("/miri"), post(miri))
         .route(&transform("/macro-expansion"), post(macro_expansion))
         .route(&transform("/meta/crates"), get_or_post(meta_crates))
-        .route(
-            &transform("/meta/versions"),
-            get_or_post(meta_versions),
-        )
+        .route(&transform("/meta/versions"), get_or_post(meta_versions))
         .route(&transform("/meta/gist"), post(meta_gist_create))
         .route(&transform("/meta/gist/"), post(meta_gist_create)) // compatibility with lax frontend code
         .route(&transform("/meta/gist/{id}"), get(meta_gist_get))
         .route(&transform("/metrics"), get(metrics))
         .route(&transform("/websocket"), get(websocket))
         .route(&transform("/nowebsocket"), post(nowebsocket))
-        .route(&transform("/internal/debug/whynowebsocket"), get(whynowebsocket))
+        .route(
+            &transform("/internal/debug/whynowebsocket"),
+            get(whynowebsocket),
+        )
         .route(
             &transform("/internal/debug/tracked-containers"),
             get(tracked_containers),
