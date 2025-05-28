@@ -3,10 +3,10 @@ import { createSelector } from '@reduxjs/toolkit';
 
 import { State } from '../reducers';
 import {
-  AceResizeKey,
   Backtrace,
   Channel,
   Edition,
+  Focus,
   Orientation,
   PrimaryActionAuto,
   PrimaryActionCore,
@@ -94,7 +94,7 @@ const LABELS: { [index in PrimaryActionCore]: string } = {
   [PrimaryActionCore.Hir]: 'Show HIR',
   [PrimaryActionCore.Mir]: 'Show MIR',
   [PrimaryActionCore.Test]: 'Test',
-  [PrimaryActionCore.Wasm]: 'Show WASM',
+  [PrimaryActionCore.Wasm]: 'Show Wasm',
 };
 
 export const getExecutionLabel = createSelector(primaryActionSelector, primaryAction => LABELS[primaryAction]);
@@ -126,8 +126,16 @@ const editionSelector = (state: State) => state.configuration.edition;
 export const isNightlyChannel = (state: State) => (
   state.configuration.channel === Channel.Nightly
 );
-export const isWasmAvailable = isNightlyChannel;
 export const isHirAvailable = isNightlyChannel;
+
+export const wasmLikelyToWork = createSelector(
+  crateTypeSelector,
+  getCrateType, (userCrateType, crateType) => {
+    // If the user set it already, assume they know what they are doing
+    if (userCrateType) { return true }
+
+    return crateType === 'cdylib';
+  });
 
 export const getModeLabel = (state: State) => {
   const { configuration: { mode } } = state;
@@ -314,6 +322,15 @@ export const isOutputFocused = createSelector(
   (focus) => !!focus,
 );
 
+export const showStdinSelector = createSelector(
+  focus,
+  (focus) => focus == Focus.Execute,
+)
+export const enableStdinSelector = createSelector(
+  (state: State) => state.output.execute.requestsInProgress,
+  (req) => req > 0,
+)
+
 const orientationConfig = (state: State) => state.configuration.orientation;
 const browserWidthIsSmall = (state: State) => state.browser.isSmall;
 
@@ -329,27 +346,30 @@ export const orientation = createSelector(
   }
 )
 
-const ratioGeneration = (state: State) => state.browser.ratioGeneration;
-
-export const aceResizeKey = createSelector(
-  focus,
-  ratioGeneration,
-  (focus, ratioGeneration): AceResizeKey => [focus, ratioGeneration],
-)
+const aceConfig = (s: State) => s.configuration.ace;
+export const aceKeybinding = createSelector(aceConfig, c => c.keybinding);
+export const acePairCharacters = createSelector(aceConfig, c => c.pairCharacters);
+export const aceTheme = createSelector(aceConfig, c => c.theme);
 
 export const offerCrateAutocompleteOnUse = createSelector(
   editionSelector,
   (edition) => edition !== Edition.Rust2015,
 );
 
+const client = (state: State) => state.client;
+const featureFlags = (state: State) => state.featureFlags;
 const websocket = (state: State) => state.websocket;
 
-export const websocketFeatureFlagEnabled = createSelector(websocket, (ws) => ws.featureFlagEnabled);
+const clientFeatureFlagThreshold = createSelector(client, (c) => c.featureFlagThreshold);
 
-export const useWebsocketSelector = createSelector(
-  websocket,
-  (ws) => ws.connected && ws.featureFlagEnabled,
-);
+const showGemThreshold = createSelector(featureFlags, ff => ff.showGemThreshold);
+
+const createFeatureFlagSelector = (ff: (state: State) => number) =>
+  createSelector(clientFeatureFlagThreshold, ff, (c, ff) => c <= ff);
+
+export const showGemSelector = createFeatureFlagSelector(showGemThreshold);
+
+export const executeViaWebsocketSelector = createSelector(websocket, (ws) => ws.connected);
 
 export type WebSocketStatus =
   { state: 'disconnected' } |
@@ -368,14 +388,37 @@ export const websocketStatusSelector = createSelector(
 export const executeRequestPayloadSelector = createSelector(
   codeSelector,
   (state: State) => state.configuration,
+  getBacktraceSet,
   (_state: State, { crateType, tests }: { crateType: string, tests: boolean }) => ({ crateType, tests }),
-  (code, configuration, { crateType, tests }) => ({
+  (code, configuration, backtrace, { crateType, tests }) => ({
     channel: configuration.channel,
     mode: configuration.mode,
     edition: configuration.edition,
     crateType,
     tests,
     code,
-    backtrace: configuration.backtrace === Backtrace.Enabled,
+    backtrace,
+  }),
+);
+
+export const compileRequestPayloadSelector = createSelector(
+  codeSelector,
+  (state: State) => state.configuration,
+  getCrateType,
+  runAsTest,
+  getBacktraceSet,
+  (_state: State, { target }: { target: string }) => ({ target }),
+  (code, configuration, crateType, tests, backtrace, { target }) => ({
+    channel: configuration.channel,
+    mode: configuration.mode,
+    edition: configuration.edition,
+    crateType,
+    tests,
+    code,
+    target,
+    assemblyFlavor: configuration.assemblyFlavor,
+    demangleAssembly: configuration.demangleAssembly,
+    processAssembly: configuration.processAssembly,
+    backtrace,
   }),
 );

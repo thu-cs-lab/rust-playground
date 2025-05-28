@@ -1,13 +1,12 @@
 import React, { useCallback } from 'react';
 import { useSelector } from 'react-redux';
 
-import * as actions from './actions';
-import * as selectors from './selectors';
-import { useAppDispatch } from './configureStore';
-
 import ButtonMenuItem from './ButtonMenuItem';
-import MenuGroup from './MenuGroup';
 import MenuAside from './MenuAside';
+import MenuGroup from './MenuGroup';
+import * as actions from './actions';
+import { useAppDispatch } from './configureStore';
+import * as selectors from './selectors';
 
 import styles from './BuildMenu.module.css';
 
@@ -18,41 +17,35 @@ interface BuildMenuProps {
 const useDispatchAndClose = (action: () => actions.ThunkAction, close: () => void) => {
   const dispatch = useAppDispatch();
 
-  return useCallback(
-    () => {
-      dispatch(action());
-      close();
-    },
-    [action, close, dispatch]
-  );
-}
+  return useCallback(() => {
+    dispatch(action());
+    close();
+  }, [action, close, dispatch]);
+};
 
-const BuildMenu: React.FC<BuildMenuProps> = props => {
+const BuildMenu: React.FC<BuildMenuProps> = (props) => {
   const isHirAvailable = useSelector(selectors.isHirAvailable);
-  const isWasmAvailable = useSelector(selectors.isWasmAvailable);
+  const wasmLikelyToWork = useSelector(selectors.wasmLikelyToWork);
 
   const compile = useDispatchAndClose(actions.performCompile, props.close);
   const compileToAssembly = useDispatchAndClose(actions.performCompileToAssembly, props.close);
   const compileToLLVM = useDispatchAndClose(actions.performCompileToLLVM, props.close);
   const compileToMir = useDispatchAndClose(actions.performCompileToMir, props.close);
   const compileToHir = useDispatchAndClose(actions.performCompileToNightlyHir, props.close);
-  const compileToWasm = useDispatchAndClose(actions.performCompileToNightlyWasm, props.close);
+  const compileToWasm = useDispatchAndClose(actions.performCompileToWasm, props.close);
   const execute = useDispatchAndClose(actions.performExecute, props.close);
   const test = useDispatchAndClose(actions.performTest, props.close);
 
   return (
     <MenuGroup title="What do you want to do?">
       <ButtonMenuItem name="Run" onClick={execute}>
-        Build and run the code, showing the output.
-        Equivalent to <code className={styles.code}>cargo run</code>.
+        Build and run the code, showing the output. Equivalent to <Code>cargo run</Code>.
       </ButtonMenuItem>
       <ButtonMenuItem name="Build" onClick={compile}>
-        Build the code without running it.
-        Equivalent to <code className={styles.code}>cargo build</code>.
+        Build the code without running it. Equivalent to <Code>cargo build</Code>.
       </ButtonMenuItem>
       <ButtonMenuItem name="Test" onClick={test}>
-        Build the code and run all the tests.
-        Equivalent to <code className={styles.code}>cargo test</code>.
+        Build the code and run all the tests. Equivalent to <Code>cargo test</Code>.
       </ButtonMenuItem>
       <ButtonMenuItem name="ASM" onClick={compileToAssembly}>
         Build and show the resulting assembly code.
@@ -67,25 +60,30 @@ const BuildMenu: React.FC<BuildMenuProps> = props => {
         Build and show the resulting HIR, Rust’s syntax-based intermediate representation.
         {!isHirAvailable && <HirAside />}
       </ButtonMenuItem>
-      <ButtonMenuItem name="WASM" onClick={compileToWasm}>
+      <ButtonMenuItem name="Wasm" onClick={compileToWasm}>
         Build a WebAssembly module for web browsers, in the .WAT textual representation.
-        {!isWasmAvailable && <WasmAside />}
+        {!wasmLikelyToWork && <WasmAside />}
       </ButtonMenuItem>
     </MenuGroup>
   );
 };
 
+const Code: React.FC<{ children: string }> = ({ children }) => (
+  <code className={styles.code}>{children}</code>
+);
+
 const HirAside: React.FC = () => (
   <MenuAside>
-    Note: HIR currently requires using the Nightly channel, selecting this
-    option will switch to Nightly.
+    Note: HIR currently requires using the Nightly channel, selecting this option will switch to
+    Nightly.
   </MenuAside>
 );
 
 const WasmAside: React.FC = () => (
   <MenuAside>
-    Note: WASM currently requires using the Nightly channel, selecting this
-    option will switch to Nightly.
+    Note: WebAssembly works best when using the <Code>cdylib</Code> crate type, but the source code
+    does not specify an explicit crate type. Selecting this option will change the code to specify{' '}
+    <Code>cdylib</Code>.
   </MenuAside>
 );
 

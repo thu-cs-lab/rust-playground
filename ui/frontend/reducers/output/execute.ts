@@ -1,13 +1,12 @@
-import { createAsyncThunk, createSlice } from '@reduxjs/toolkit';
+import { AnyAction, Draft, createAsyncThunk, createSlice } from '@reduxjs/toolkit';
 import * as z from 'zod';
 
 import { SimpleThunkAction, adaptFetchError, jsonPost, routes } from '../../actions';
-import { executeRequestPayloadSelector, useWebsocketSelector } from '../../selectors';
+import { executeRequestPayloadSelector, executeViaWebsocketSelector } from '../../selectors';
 import { Channel, Edition, Mode } from '../../types';
 import {
   WsPayloadAction,
-  createWebsocketResponseAction,
-  createWebsocketResponseSchema,
+  createWebsocketResponse,
   makeWebSocketMeta,
 } from '../../websocketActions';
 
@@ -23,13 +22,6 @@ interface State {
   error?: string;
 }
 
-const wsExecuteResponsePayloadSchema = z.object({
-  success: z.boolean(),
-  stdout: z.string(),
-  stderr: z.string(),
-});
-type wsExecuteResponsePayload = z.infer<typeof wsExecuteResponsePayloadSchema>;
-
 type wsExecuteRequestPayload = {
   channel: Channel;
   mode: Mode;
@@ -40,8 +32,27 @@ type wsExecuteRequestPayload = {
   backtrace: boolean;
 };
 
-const wsExecuteResponse = createWebsocketResponseAction<wsExecuteResponsePayload>(
-  'output/execute/wsExecuteResponse',
+const { action: wsExecuteBegin, schema: wsExecuteBeginSchema } = createWebsocketResponse(
+  'output/execute/wsExecuteBegin',
+  z.undefined(),
+);
+
+const { action: wsExecuteStdout, schema: wsExecuteStdoutSchema } = createWebsocketResponse(
+  'output/execute/wsExecuteStdout',
+  z.string(),
+);
+
+const { action: wsExecuteStderr, schema: wsExecuteStderrSchema } = createWebsocketResponse(
+  'output/execute/wsExecuteStderr',
+  z.string(),
+);
+
+const { action: wsExecuteEnd, schema: wsExecuteEndSchema } = createWebsocketResponse(
+  'output/execute/wsExecuteEnd',
+  z.object({
+    success: z.boolean(),
+    exitDetail: z.string(),
+  }),
 );
 
 const sliceName = 'output/execute';
@@ -58,6 +69,7 @@ export interface ExecuteRequestBody {
 
 interface ExecuteResponseBody {
   success: boolean;
+  exitDetail: string;
   stdout: string;
   stderr: string;
 }
@@ -65,6 +77,27 @@ interface ExecuteResponseBody {
 export const performExecute = createAsyncThunk(sliceName, async (payload: ExecuteRequestBody) =>
   adaptFetchError(() => jsonPost<ExecuteResponseBody>(routes.execute, payload)),
 );
+
+const prepareWithCurrentSequenceNumber = <P>(payload: P, sequenceNumber: number) => ({
+  payload,
+  meta: {
+    websocket: true,
+    sequenceNumber,
+  },
+});
+
+const sequenceNumberMatches =
+  <P>(whenMatch: (state: Draft<State>, payload: P) => void) =>
+  (state: Draft<State>, action: WsPayloadAction<P>) => {
+    const {
+      payload,
+      meta: { sequenceNumber },
+    } = action;
+
+    if (sequenceNumber === state.sequenceNumber) {
+      whenMatch(state, payload);
+    }
+  };
 
 const slice = createSlice({
   name: 'output/execute',
@@ -75,7 +108,6 @@ const slice = createSlice({
         const { sequenceNumber } = action.meta;
         if (sequenceNumber >= (state.sequenceNumber ?? 0)) {
           state.sequenceNumber = sequenceNumber;
-          state.requestsInProgress = 1; // Only tracking one request
         }
       },
 
@@ -84,6 +116,21 @@ const slice = createSlice({
         meta: makeWebSocketMeta(),
       }),
     },
+    wsExecuteStdin: {
+      reducer: () => {},
+
+      prepare: prepareWithCurrentSequenceNumber,
+    },
+    wsExecuteStdinClose: {
+      reducer: () => {},
+
+      prepare: prepareWithCurrentSequenceNumber,
+    },
+    wsExecuteKill: {
+      reducer: () => {},
+
+      prepare: prepareWithCurrentSequenceNumber,
+    },
   },
   extraReducers: (builder) => {
     builder
@@ -91,8 +138,12 @@ const slice = createSlice({
         state.requestsInProgress += 1;
       })
       .addCase(performExecute.fulfilled, (state, action) => {
-        const { stdout, stderr } = action.payload;
+        const { success, exitDetail, stdout, stderr } = action.payload;
         Object.assign(state, { stdout, stderr });
+        delete state.error;
+        if (!success) {
+          state.error = exitDetail;
+        }
         state.requestsInProgress -= 1;
       })
       .addCase(performExecute.rejected, (state, action) => {
@@ -102,17 +153,38 @@ const slice = createSlice({
         }
         state.requestsInProgress -= 1;
       })
-      .addCase(wsExecuteResponse, (state, action) => {
-        const {
-          payload: { stdout, stderr },
-          meta: { sequenceNumber },
-        } = action;
-
-        if (sequenceNumber >= (state.sequenceNumber ?? 0)) {
-          Object.assign(state, { stdout, stderr });
+      .addCase(
+        wsExecuteBegin,
+        sequenceNumberMatches((state) => {
+          state.requestsInProgress = 1; // Only tracking one request
+          state.stdout = '';
+          state.stderr = '';
+          delete state.error;
+        }),
+      )
+      .addCase(
+        wsExecuteStdout,
+        sequenceNumberMatches((state, payload) => {
+          state.stdout += payload;
+        }),
+      )
+      .addCase(
+        wsExecuteStderr,
+        sequenceNumberMatches((state, payload) => {
+          state.stderr += payload;
+        }),
+      )
+      .addCase(
+        wsExecuteEnd,
+        sequenceNumberMatches((state, payload) => {
           state.requestsInProgress = 0; // Only tracking one request
-        }
-      });
+          delete state.sequenceNumber;
+
+          if (!payload.success) {
+            state.error = payload.exitDetail;
+          }
+        }),
+      );
   },
 });
 
@@ -123,7 +195,7 @@ export const performCommonExecute =
   (dispatch, getState) => {
     const state = getState();
     const body = executeRequestPayloadSelector(state, { crateType, tests });
-    const useWebSocket = useWebsocketSelector(state);
+    const useWebSocket = executeViaWebsocketSelector(state);
 
     if (useWebSocket) {
       dispatch(wsExecuteRequest(body));
@@ -132,9 +204,32 @@ export const performCommonExecute =
     }
   };
 
-export const wsExecuteResponseSchema = createWebsocketResponseSchema(
-  wsExecuteResponse,
-  wsExecuteResponsePayloadSchema,
-);
+const dispatchWhenSequenceNumber =
+  <A extends AnyAction>(cb: (sequenceNumber: number) => A): SimpleThunkAction =>
+  (dispatch, getState) => {
+    const state = getState();
+    const { sequenceNumber } = state.output.execute;
+    if (sequenceNumber) {
+      const action = cb(sequenceNumber);
+      dispatch(action);
+    }
+  };
+
+export const wsExecuteStdin = (payload: string): SimpleThunkAction =>
+  dispatchWhenSequenceNumber((sequenceNumber) =>
+    slice.actions.wsExecuteStdin(payload, sequenceNumber),
+  );
+
+export const wsExecuteStdinClose = (): SimpleThunkAction =>
+  dispatchWhenSequenceNumber((sequenceNumber) =>
+    slice.actions.wsExecuteStdinClose(undefined, sequenceNumber),
+  );
+
+export const wsExecuteKill = (): SimpleThunkAction =>
+  dispatchWhenSequenceNumber((sequenceNumber) =>
+    slice.actions.wsExecuteKill(undefined, sequenceNumber),
+  );
+
+export { wsExecuteBeginSchema, wsExecuteStdoutSchema, wsExecuteStderrSchema, wsExecuteEndSchema };
 
 export default slice.reducer;

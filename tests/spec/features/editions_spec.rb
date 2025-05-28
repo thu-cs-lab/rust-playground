@@ -24,7 +24,7 @@ RSpec.feature "Multiple Rust editions", type: :feature, js: true do
     click_on("Run")
 
     within(:output, :stderr) do
-      expect(page).to have_content "thread 'main' panicked at 'Box<dyn Any>'"
+      expect(page).to have_content "thread 'main' panicked at src/main.rs:3:5"
     end
   end
 
@@ -34,6 +34,27 @@ RSpec.feature "Multiple Rust editions", type: :feature, js: true do
 
     within(:output, :stderr) do
       expect(page).to have_content 'format argument must be a string literal', wait: 10
+    end
+  end
+
+  scenario "using the 2024 edition" do
+    editor.set <<-EOF
+      #![feature(gen_blocks)]
+
+      fn main() {
+          let mut x = gen { yield 1 };
+
+          eprintln!("{:?}", x.next());
+          eprintln!("{:?}", x.next());
+      }
+    EOF
+
+    in_advanced_options_menu { select '2024' }
+    click_on("Run")
+
+    within(:output, :stderr) do
+      expect(page).to have_content 'Some(1)'
+      expect(page).to have_content 'None'
     end
   end
 

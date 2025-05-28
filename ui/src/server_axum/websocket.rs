@@ -1,18 +1,42 @@
 use crate::{
-    metrics, parse_channel, parse_crate_type, parse_edition, parse_mode,
-    sandbox::{self, Sandbox},
-    Error, ExecutionSnafu, Result, SandboxCreationSnafu, WebSocketTaskPanicSnafu,
+    metrics::{self, record_metric, Endpoint, HasLabelsCore, Outcome},
+    server_axum::api_orchestrator_integration_impls::*,
+    Error, Result, StreamingCoordinatorExecuteStdinSnafu, StreamingCoordinatorIdleSnafu,
+    StreamingCoordinatorSpawnSnafu, StreamingExecuteSnafu, WebSocketTaskPanicSnafu,
 };
 
 use axum::extract::ws::{Message, WebSocket};
+use futures::{Future, FutureExt};
+use orchestrator::{
+    coordinator::{self, Coordinator, DockerBackend},
+    DropErrorDetailsExt,
+};
 use snafu::prelude::*;
 use std::{
-    convert::{TryFrom, TryInto},
-    time::Instant,
+    collections::BTreeMap,
+    convert::TryFrom,
+    mem,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
 };
-use tokio::{sync::mpsc, task::JoinSet};
+use tokio::{
+    sync::{mpsc, Semaphore},
+    task::{AbortHandle, JoinSet},
+    time,
+};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, instrument, warn, Instrument};
 
-type Meta = serde_json::Value;
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MetaInner {
+    sequence_number: i64,
+}
+
+type Meta = Arc<MetaInner>;
 
 #[derive(serde::Deserialize)]
 #[serde(tag = "type")]
@@ -36,6 +60,15 @@ struct Connected {
 enum WSMessageRequest {
     #[serde(rename = "output/execute/wsExecuteRequest")]
     ExecuteRequest { payload: ExecuteRequest, meta: Meta },
+
+    #[serde(rename = "output/execute/wsExecuteStdin")]
+    ExecuteStdin { payload: String, meta: Meta },
+
+    #[serde(rename = "output/execute/wsExecuteStdinClose")]
+    ExecuteStdinClose { meta: Meta },
+
+    #[serde(rename = "output/execute/wsExecuteKill")]
+    ExecuteKill { meta: Meta },
 }
 
 #[derive(serde::Deserialize)]
@@ -50,8 +83,8 @@ struct ExecuteRequest {
     backtrace: bool,
 }
 
-impl TryFrom<ExecuteRequest> for sandbox::ExecuteRequest {
-    type Error = Error;
+impl TryFrom<ExecuteRequest> for coordinator::ExecuteRequest {
+    type Error = ExecuteRequestParseError;
 
     fn try_from(value: ExecuteRequest) -> Result<Self, Self::Error> {
         let ExecuteRequest {
@@ -64,7 +97,7 @@ impl TryFrom<ExecuteRequest> for sandbox::ExecuteRequest {
             backtrace,
         } = value;
 
-        Ok(sandbox::ExecuteRequest {
+        Ok(coordinator::ExecuteRequest {
             channel: parse_channel(&channel)?,
             mode: parse_mode(&mode)?,
             edition: parse_edition(&edition)?,
@@ -76,14 +109,41 @@ impl TryFrom<ExecuteRequest> for sandbox::ExecuteRequest {
     }
 }
 
+#[derive(Debug, Snafu)]
+pub(crate) enum ExecuteRequestParseError {
+    #[snafu(context(false))]
+    Channel { source: ParseChannelError },
+
+    #[snafu(context(false))]
+    CrateType { source: ParseCrateTypeError },
+
+    #[snafu(context(false))]
+    Mode { source: ParseModeError },
+
+    #[snafu(context(false))]
+    Edition { source: ParseEditionError },
+}
+
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "type")]
 enum MessageResponse {
     #[serde(rename = "websocket/error")]
     Error { payload: WSError, meta: Meta },
 
-    #[serde(rename = "output/execute/wsExecuteResponse")]
-    ExecuteResponse {
+    #[serde(rename = "featureFlags")]
+    FeatureFlags { payload: FeatureFlags, meta: Meta },
+
+    #[serde(rename = "output/execute/wsExecuteBegin")]
+    ExecuteBegin { meta: Meta },
+
+    #[serde(rename = "output/execute/wsExecuteStdout")]
+    ExecuteStdout { payload: String, meta: Meta },
+
+    #[serde(rename = "output/execute/wsExecuteStderr")]
+    ExecuteStderr { payload: String, meta: Meta },
+
+    #[serde(rename = "output/execute/wsExecuteEnd")]
+    ExecuteEnd {
         payload: ExecuteResponse,
         meta: Meta,
     },
@@ -97,58 +157,191 @@ struct WSError {
 
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ExecuteResponse {
-    success: bool,
-    stdout: String,
-    stderr: String,
-}
+pub(crate) struct FeatureFlags {}
 
-impl From<sandbox::ExecuteResponse> for ExecuteResponse {
-    fn from(value: sandbox::ExecuteResponse) -> Self {
-        let sandbox::ExecuteResponse {
-            success,
-            stdout,
-            stderr,
-        } = value;
-
-        ExecuteResponse {
-            success,
-            stdout,
-            stderr,
-        }
+impl From<crate::FeatureFlags> for FeatureFlags {
+    fn from(_value: crate::FeatureFlags) -> Self {
+        Self {}
     }
 }
 
-pub async fn handle(socket: WebSocket) {
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ExecuteResponse {
+    success: bool,
+    exit_detail: String,
+}
+
+#[instrument(skip_all, fields(ws_id))]
+pub(crate) async fn handle(socket: WebSocket, feature_flags: FeatureFlags) {
+    static WEBSOCKET_ID: AtomicU64 = AtomicU64::new(0);
+
     metrics::LIVE_WS.inc();
     let start = Instant::now();
 
-    handle_core(socket).await;
+    let id = WEBSOCKET_ID.fetch_add(1, Ordering::SeqCst);
+    tracing::Span::current().record("ws_id", &id);
+
+    handle_core(socket, feature_flags).await;
 
     metrics::LIVE_WS.dec();
     let elapsed = start.elapsed();
     metrics::DURATION_WS.observe(elapsed.as_secs_f64());
 }
 
-async fn handle_core(mut socket: WebSocket) {
+type ResponseTx = mpsc::Sender<Result<MessageResponse>>;
+type SharedCoordinator = Arc<Coordinator<DockerBackend>>;
+
+/// Manages a limited amount of access to the `Coordinator`.
+///
+/// Has a number of responsibilities:
+///
+/// - Constructs the `Coordinator` on demand.
+///
+/// - Only allows one job of a certain kind at a time (e.g. executing
+///   vs formatting). Older jobs will be cancelled.
+///
+/// - Allows limited parallelism between jobs of different types.
+struct CoordinatorManager {
+    coordinator: SharedCoordinator,
+    tasks: JoinSet<Result<()>>,
+    semaphore: Arc<Semaphore>,
+    abort_handles: [Option<AbortHandle>; Self::N_KINDS],
+}
+
+impl CoordinatorManager {
+    const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+    const SESSION_TIMEOUT: Duration = Duration::from_secs(45 * 60);
+
+    const N_PARALLEL: usize = 2;
+
+    const N_KINDS: usize = 1;
+    const KIND_EXECUTE: usize = 0;
+
+    async fn new() -> Self {
+        Self {
+            coordinator: Arc::new(Coordinator::new_docker().await),
+            tasks: Default::default(),
+            semaphore: Arc::new(Semaphore::new(Self::N_PARALLEL)),
+            abort_handles: Default::default(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
+    }
+
+    async fn join_next(&mut self) -> Option<Result<Result<()>, tokio::task::JoinError>> {
+        self.tasks.join_next().await
+    }
+
+    async fn spawn<F, Fut>(&mut self, handler: F) -> CoordinatorManagerResult<()>
+    where
+        F: FnOnce(SharedCoordinator) -> Fut,
+        F: 'static + Send,
+        Fut: Future<Output = Result<()>>,
+        Fut: 'static + Send,
+    {
+        let coordinator = self.coordinator.clone();
+        let semaphore = self.semaphore.clone();
+
+        let new_abort_handle = self.tasks.spawn(
+            async move {
+                let _permit = semaphore.acquire().await;
+                handler(coordinator).await
+            }
+            .in_current_span(),
+        );
+
+        let kind = Self::KIND_EXECUTE; // TODO: parameterize when we get a second kind
+        let old_abort_handle = self.abort_handles[kind].replace(new_abort_handle);
+
+        if let Some(abort_handle) = old_abort_handle {
+            abort_handle.abort();
+        }
+
+        Ok(())
+    }
+
+    async fn idle(&mut self) -> CoordinatorManagerResult<()> {
+        use coordinator_manager_error::*;
+
+        Arc::get_mut(&mut self.coordinator)
+            .context(OutstandingCoordinatorIdleSnafu)?
+            .idle()
+            .await
+            .context(IdleSnafu)?;
+
+        Ok(())
+    }
+
+    async fn shutdown(mut self) -> CoordinatorManagerResult<()> {
+        use coordinator_manager_error::*;
+
+        self.tasks.shutdown().await;
+        Arc::into_inner(self.coordinator)
+            .context(OutstandingCoordinatorShutdownSnafu)?
+            .shutdown()
+            .await
+            .context(ShutdownSnafu)?;
+
+        Ok(())
+    }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum CoordinatorManagerError {
+    #[snafu(display("The coordinator is still referenced and cannot be idled"))]
+    OutstandingCoordinatorIdle,
+
+    #[snafu(display("Could not idle the coordinator"))]
+    Idle { source: coordinator::Error },
+
+    #[snafu(display("The coordinator is still referenced and cannot be shut down"))]
+    OutstandingCoordinatorShutdown,
+
+    #[snafu(display("Could not shut down the coordinator"))]
+    Shutdown { source: coordinator::Error },
+}
+
+type CoordinatorManagerResult<T, E = CoordinatorManagerError> = std::result::Result<T, E>;
+
+async fn handle_core(mut socket: WebSocket, feature_flags: FeatureFlags) {
     if !connect_handshake(&mut socket).await {
         return;
     }
 
     let (tx, mut rx) = mpsc::channel(3);
-    let mut tasks = JoinSet::new();
 
-    // TODO: Implement some kind of timeout to shutdown running work?
+    let ff = MessageResponse::FeatureFlags {
+        payload: feature_flags,
+        meta: create_server_meta(),
+    };
+
+    if tx.send(Ok(ff)).await.is_err() {
+        return;
+    }
+
+    let mut manager = CoordinatorManager::new().await;
+    tokio::pin! {
+        let session_timeout = time::sleep(CoordinatorManager::SESSION_TIMEOUT);
+    }
+
+    let mut active_executions = BTreeMap::new();
+    let mut active_execution_gc_interval = time::interval(Duration::from_secs(30));
 
     loop {
         tokio::select! {
             request = socket.recv() => {
+                metrics::WS_INCOMING.inc();
+
                 match request {
                     None => {
                         // browser disconnected
                         break;
                     }
-                    Some(Ok(Message::Text(txt))) => handle_msg(txt, &tx, &mut tasks).await,
+                    Some(Ok(Message::Text(txt))) => handle_msg(txt, &tx, &mut manager, &mut active_executions).await,
                     Some(Ok(_)) => {
                         // unknown message type
                         continue;
@@ -156,63 +349,106 @@ async fn handle_core(mut socket: WebSocket) {
                     Some(Err(e)) => super::record_websocket_error(e.to_string()),
                 }
             },
+
             resp = rx.recv() => {
                 let resp = resp.expect("The rx should never close as we have a tx");
+                let success = resp.is_ok();
                 let resp = resp.unwrap_or_else(error_to_response);
                 let resp = response_to_message(resp);
 
-                if let Err(_) = socket.send(resp).await {
+                if socket.send(resp).await.is_err() {
                     // We can't send a response
                     break;
                 }
-            },
-            // We don't care if there are no running tasks
-            Some(task) = tasks.join_next() => {
-                let Err(error) = task else { continue };
-                // The task was cancelled; no need to report
-                let Ok(panic) = error.try_into_panic() else { continue };
 
-                let text = match panic.downcast::<String>() {
-                    Ok(text) => *text,
-                    Err(panic) => match panic.downcast::<&str>() {
-                        Ok(text) => text.to_string(),
-                        _ => "An unknown panic occurred".into(),
+                let success = if success { "true" } else { "false" };
+                metrics::WS_OUTGOING.with_label_values(&[success]).inc();
+            },
+
+            // We don't care if there are no running tasks
+            Some(task) = manager.join_next() => {
+                let error = match task {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(error)) => error,
+                    Err(error) => {
+                        // The task was cancelled; no need to report
+                        let Ok(panic) = error.try_into_panic() else { continue };
+
+                        let text = match panic.downcast::<String>() {
+                            Ok(text) => *text,
+                            Err(panic) => match panic.downcast::<&str>() {
+                                Ok(text) => text.to_string(),
+                                _ => "An unknown panic occurred".into(),
+                            }
+                        };
+                        WebSocketTaskPanicSnafu { text }.build()
                     }
                 };
-                let error = WebSocketTaskPanicSnafu { text }.build();
 
-                let resp = error_to_response(error);
-                let resp = response_to_message(resp);
-
-                if let Err(_) = socket.send(resp).await {
+                if tx.send(Err(error)).await.is_err() {
                     // We can't send a response
                     break;
                 }
             },
+
+            _ = active_execution_gc_interval.tick() => {
+                active_executions = mem::take(&mut active_executions)
+                    .into_iter()
+                    .filter(|(_id, (_, tx))| !tx.is_closed())
+                    .collect();
+            },
+
+            _ = time::sleep(CoordinatorManager::IDLE_TIMEOUT), if manager.is_empty() => {
+                let idled = manager.idle().await.context(StreamingCoordinatorIdleSnafu);
+
+                let Err(error) = idled else { continue };
+
+                if tx.send(Err(error)).await.is_err() {
+                    // We can't send a response
+                    break;
+                }
+            },
+
+            _ = &mut session_timeout => {
+                break;
+            }
         }
     }
 
     drop((tx, rx, socket));
-    tasks.shutdown().await;
+    if let Err(e) = manager.shutdown().await {
+        error!("Could not shut down the Coordinator: {e:?}");
+    }
 }
 
 async fn connect_handshake(socket: &mut WebSocket) -> bool {
-    let Some(Ok(Message::Text(txt))) = socket.recv().await else { return false };
-    let Ok(HandshakeMessage::Connected { payload, .. }) = serde_json::from_str::<HandshakeMessage>(&txt) else { return false };
+    let Some(Ok(Message::Text(txt))) = socket.recv().await else {
+        return false;
+    };
+    let Ok(HandshakeMessage::Connected { payload, .. }) =
+        serde_json::from_str::<HandshakeMessage>(&txt)
+    else {
+        return false;
+    };
     if !payload.i_accept_this_is_an_unsupported_api {
         return false;
     }
     socket.send(Message::Text(txt)).await.is_ok()
 }
 
+fn create_server_meta() -> Meta {
+    Arc::new(MetaInner {
+        sequence_number: -1,
+    })
+}
+
 fn error_to_response(error: Error) -> MessageResponse {
     let error = error.to_string();
+    let payload = WSError { error };
     // TODO: thread through the Meta from the originating request
-    let meta = serde_json::json!({ "sequenceNumber": -1 });
-    MessageResponse::Error {
-        payload: WSError { error },
-        meta,
-    }
+    let meta = create_server_meta();
+
+    MessageResponse::Error { payload, meta }
 }
 
 fn response_to_message(response: MessageResponse) -> Message {
@@ -224,8 +460,9 @@ fn response_to_message(response: MessageResponse) -> Message {
 
 async fn handle_msg(
     txt: String,
-    tx: &mpsc::Sender<Result<MessageResponse>>,
-    tasks: &mut JoinSet<Result<()>>,
+    tx: &ResponseTx,
+    manager: &mut CoordinatorManager,
+    active_executions: &mut BTreeMap<i64, (CancellationToken, mpsc::Sender<String>)>,
 ) {
     use WSMessageRequest::*;
 
@@ -233,25 +470,229 @@ async fn handle_msg(
 
     match msg {
         Ok(ExecuteRequest { payload, meta }) => {
-            let tx = tx.clone();
-            tasks.spawn(async move {
-                let resp = handle_execute(payload).await;
-                let resp = resp.map(|payload| MessageResponse::ExecuteResponse { payload, meta });
-                tx.send(resp).await.ok(/* We don't care if the channel is closed */);
-                Ok(())
-            });
+            let token = CancellationToken::new();
+            let (execution_tx, execution_rx) = mpsc::channel(8);
+
+            active_executions.insert(meta.sequence_number, (token.clone(), execution_tx));
+
+            // TODO: Should a single execute / build / etc. session have a timeout of some kind?
+            let spawned = manager
+                .spawn({
+                    let tx = tx.clone();
+                    |coordinator| {
+                        handle_execute(token, execution_rx, tx, coordinator, payload, meta)
+                            .context(StreamingExecuteSnafu)
+                    }
+                })
+                .await
+                .context(StreamingCoordinatorSpawnSnafu);
+
+            if let Err(e) = spawned {
+                tx.send(Err(e)).await.ok(/* We don't care if the channel is closed */);
+            }
         }
+
+        Ok(ExecuteStdin { payload, meta }) => {
+            let Some((_, execution_tx)) = active_executions.get(&meta.sequence_number) else {
+                warn!("Received stdin for an execution that is no longer active");
+                return;
+            };
+            let sent = execution_tx
+                .send(payload)
+                .await
+                .drop_error_details()
+                .context(StreamingCoordinatorExecuteStdinSnafu);
+
+            if let Err(e) = sent {
+                tx.send(Err(e)).await.ok(/* We don't care if the channel is closed */);
+            }
+        }
+
+        Ok(ExecuteStdinClose { meta }) => {
+            let execution_tx = active_executions.remove(&meta.sequence_number);
+            drop(execution_tx); // Signal closed
+        }
+
+        Ok(ExecuteKill { meta }) => {
+            if let Some((token, _)) = active_executions.remove(&meta.sequence_number) {
+                token.cancel();
+            }
+        }
+
         Err(e) => {
-            let resp = Err(e);
-            tx.send(resp).await.ok(/* We don't care if the channel is closed */);
+            tx.send(Err(e)).await.ok(/* We don't care if the channel is closed */);
         }
     }
 }
 
-async fn handle_execute(req: ExecuteRequest) -> Result<ExecuteResponse> {
-    let sb = Sandbox::new().await.context(SandboxCreationSnafu)?;
-
-    let req = req.try_into()?;
-    let resp = sb.execute(&req).await.context(ExecutionSnafu)?;
-    Ok(resp.into())
+#[derive(Debug)]
+enum CompletedOrAbandoned<T> {
+    Abandoned,
+    Completed(T),
 }
+
+macro_rules! abandon_if_closed {
+    ($sent:expr) => {
+        if $sent.is_err() {
+            return Ok(CompletedOrAbandoned::Abandoned);
+        }
+    };
+}
+
+async fn handle_execute(
+    token: CancellationToken,
+    rx: mpsc::Receiver<String>,
+    tx: ResponseTx,
+    coordinator: SharedCoordinator,
+    req: ExecuteRequest,
+    meta: Meta,
+) -> ExecuteResult<()> {
+    use execute_error::*;
+    use CompletedOrAbandoned::*;
+
+    let req = coordinator::ExecuteRequest::try_from(req).context(BadRequestSnafu)?;
+
+    let labels_core = req.labels_core();
+
+    let start = Instant::now();
+    let v = handle_execute_inner(token, rx, tx, coordinator, req, meta).await;
+    let elapsed = start.elapsed();
+
+    let outcome = match &v {
+        Ok(Abandoned) => Outcome::Abandoned,
+        Ok(Completed(v)) => *v,
+        Err(_) => Outcome::ErrorServer,
+    };
+
+    record_metric(Endpoint::Execute, labels_core, outcome, elapsed);
+
+    v?;
+    Ok(())
+}
+
+async fn handle_execute_inner(
+    token: CancellationToken,
+    mut rx: mpsc::Receiver<String>,
+    tx: ResponseTx,
+    coordinator: SharedCoordinator,
+    req: coordinator::ExecuteRequest,
+    meta: Meta,
+) -> ExecuteResult<CompletedOrAbandoned<Outcome>> {
+    use execute_error::*;
+    use CompletedOrAbandoned::*;
+
+    let coordinator::ActiveExecution {
+        mut task,
+        stdin_tx,
+        mut stdout_rx,
+        mut stderr_rx,
+    } = coordinator
+        .begin_execute(token.clone(), req)
+        .await
+        .context(BeginSnafu)?;
+
+    let sent = tx
+        .send(Ok(MessageResponse::ExecuteBegin { meta: meta.clone() }))
+        .await;
+    abandon_if_closed!(sent);
+
+    let mut stdin_tx = Some(stdin_tx);
+
+    let send_stdout = |payload| async {
+        let meta = meta.clone();
+        tx.send(Ok(MessageResponse::ExecuteStdout { payload, meta }))
+            .await
+    };
+
+    let send_stderr = |payload| async {
+        let meta = meta.clone();
+        tx.send(Ok(MessageResponse::ExecuteStderr { payload, meta }))
+            .await
+    };
+
+    let status = loop {
+        tokio::select! {
+            status = &mut task => break status,
+
+            stdin = rx.recv(), if stdin_tx.is_some() => {
+                match stdin {
+                    Some(stdin) => {
+                        stdin_tx
+                            .as_ref()
+                            .unwrap(/* This is a precondition */)
+                            .send(stdin)
+                            .await
+                            .drop_error_details()
+                            .context(StdinSnafu)?;
+                    }
+                    None => {
+                        let stdin_tx = stdin_tx.take();
+                        drop(stdin_tx); // Signal closed
+                    }
+                }
+            }
+
+            Some(stdout) = stdout_rx.recv() => {
+                let sent = send_stdout(stdout).await;
+                abandon_if_closed!(sent);
+            },
+
+            Some(stderr) = stderr_rx.recv() => {
+                let sent = send_stderr(stderr).await;
+                abandon_if_closed!(sent);
+            },
+        }
+    };
+
+    // Drain any remaining output
+    while let Some(Some(stdout)) = stdout_rx.recv().now_or_never() {
+        let sent = send_stdout(stdout).await;
+        abandon_if_closed!(sent);
+    }
+
+    while let Some(Some(stderr)) = stderr_rx.recv().now_or_never() {
+        let sent = send_stderr(stderr).await;
+        abandon_if_closed!(sent);
+    }
+
+    let status = status.context(EndSnafu)?;
+    let outcome = Outcome::from_success(&status);
+
+    let coordinator::ExecuteResponse {
+        success,
+        exit_detail,
+    } = status;
+
+    let sent = tx
+        .send(Ok(MessageResponse::ExecuteEnd {
+            payload: ExecuteResponse {
+                success,
+                exit_detail,
+            },
+            meta,
+        }))
+        .await;
+    abandon_if_closed!(sent);
+
+    Ok(Completed(outcome))
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub(crate) enum ExecuteError {
+    #[snafu(display("The request could not be parsed"))]
+    BadRequest { source: ExecuteRequestParseError },
+
+    #[snafu(display("Could not begin the execution session"))]
+    Begin { source: coordinator::ExecuteError },
+
+    #[snafu(display("Could not end the execution session"))]
+    End { source: coordinator::ExecuteError },
+
+    #[snafu(display("Could not send stdin to the coordinator"))]
+    Stdin {
+        source: tokio::sync::mpsc::error::SendError<()>,
+    },
+}
+
+type ExecuteResult<T, E = ExecuteError> = std::result::Result<T, E>;

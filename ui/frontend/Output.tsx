@@ -1,7 +1,7 @@
 import React, { useCallback } from 'react';
 import { useSelector, useDispatch } from 'react-redux';
 
-import * as actions from './actions';
+import { changeFocus } from './reducers/output/meta';
 import { State } from './reducers';
 import { Focus } from './types';
 
@@ -13,6 +13,7 @@ import PaneWithMir from './Output/PaneWithMir';
 import * as selectors from './selectors';
 
 import styles from './Output.module.css';
+import Stdin from './Stdin';
 
 const Tab: React.FC<TabProps> = ({ kind, focus, label, onClick, tabProps }) => {
   if (selectors.hasProperties(tabProps)) {
@@ -51,18 +52,20 @@ const Output: React.FC = () => {
     useSelector((state: State) => state.output);
 
   const dispatch = useDispatch();
-  const focusClose = useCallback(() => dispatch(actions.changeFocus()), [dispatch]);
-  const focusExecute = useCallback(() => dispatch(actions.changeFocus(Focus.Execute)), [dispatch]);
-  const focusFormat = useCallback(() => dispatch(actions.changeFocus(Focus.Format)), [dispatch]);
-  const focusClippy = useCallback(() => dispatch(actions.changeFocus(Focus.Clippy)), [dispatch]);
-  const focusMiri = useCallback(() => dispatch(actions.changeFocus(Focus.Miri)), [dispatch]);
-  const focusMacroExpansion = useCallback(() => dispatch(actions.changeFocus(Focus.MacroExpansion)), [dispatch]);
-  const focusAssembly = useCallback(() => dispatch(actions.changeFocus(Focus.Asm)), [dispatch]);
-  const focusLlvmIr = useCallback(() => dispatch(actions.changeFocus(Focus.LlvmIr)), [dispatch]);
-  const focusMir = useCallback(() => dispatch(actions.changeFocus(Focus.Mir)), [dispatch]);
-  const focusHir = useCallback(() => dispatch(actions.changeFocus(Focus.Hir)), [dispatch]);
-  const focusWasm = useCallback(() => dispatch(actions.changeFocus(Focus.Wasm)), [dispatch]);
-  const focusGist = useCallback(() => dispatch(actions.changeFocus(Focus.Gist)), [dispatch]);
+  const focusClose = useCallback(() => dispatch(changeFocus()), [dispatch]);
+  const focusExecute = useCallback(() => dispatch(changeFocus(Focus.Execute)), [dispatch]);
+  const focusFormat = useCallback(() => dispatch(changeFocus(Focus.Format)), [dispatch]);
+  const focusClippy = useCallback(() => dispatch(changeFocus(Focus.Clippy)), [dispatch]);
+  const focusMiri = useCallback(() => dispatch(changeFocus(Focus.Miri)), [dispatch]);
+  const focusMacroExpansion = useCallback(() => dispatch(changeFocus(Focus.MacroExpansion)), [dispatch]);
+  const focusAssembly = useCallback(() => dispatch(changeFocus(Focus.Asm)), [dispatch]);
+  const focusLlvmIr = useCallback(() => dispatch(changeFocus(Focus.LlvmIr)), [dispatch]);
+  const focusMir = useCallback(() => dispatch(changeFocus(Focus.Mir)), [dispatch]);
+  const focusHir = useCallback(() => dispatch(changeFocus(Focus.Hir)), [dispatch]);
+  const focusWasm = useCallback(() => dispatch(changeFocus(Focus.Wasm)), [dispatch]);
+  const focusGist = useCallback(() => dispatch(changeFocus(Focus.Gist)), [dispatch]);
+
+  const showStdin = useSelector(selectors.showStdinSelector);
 
   if (!somethingToShow) {
     return null;
@@ -74,19 +77,26 @@ const Output: React.FC = () => {
     close = <button className={styles.tabClose} onClick={focusClose}>Close</button>;
 
     body = (
-      <div className={styles.body}>
-        {focus === Focus.Execute && <Execute />}
-        {focus === Focus.Format && <SimplePane {...format} kind="format" />}
-        {focus === Focus.Clippy && <SimplePane {...clippy} kind="clippy" />}
-        {focus === Focus.Miri && <SimplePane {...miri} kind="miri" />}
-        {focus === Focus.MacroExpansion && <SimplePane {...macroExpansion} kind="macro-expansion" />}
-        {focus === Focus.Asm && <PaneWithCode {...assembly} kind="asm" />}
-        {focus === Focus.LlvmIr && <PaneWithCode {...llvmIr} kind="llvm-ir" />}
-        {focus === Focus.Mir && <PaneWithMir {...mir} kind="mir" />}
-        {focus === Focus.Hir && <PaneWithMir {...hir} kind="hir" />}
-        {focus === Focus.Wasm && <PaneWithCode {...wasm} kind="wasm" />}
-        {focus === Focus.Gist && <Gist />}
-      </div>
+      <>
+        <div className={styles.body}>
+          {focus === Focus.Execute && <Execute />}
+          {focus === Focus.Format && <SimplePane {...format} kind="format" />}
+          {focus === Focus.Clippy && <SimplePane {...clippy} kind="clippy" />}
+          {focus === Focus.Miri && <SimplePane {...miri} kind="miri" />}
+          {focus === Focus.MacroExpansion && <SimplePane {...macroExpansion} kind="macro-expansion" />}
+          {focus === Focus.Asm && <PaneWithCode {...assembly} kind="asm" />}
+          {focus === Focus.LlvmIr && <PaneWithCode {...llvmIr} kind="llvm-ir" />}
+          {focus === Focus.Mir && <PaneWithMir {...mir} kind="mir" />}
+          {focus === Focus.Hir && <PaneWithMir {...hir} kind="hir" />}
+          {focus === Focus.Wasm && <PaneWithCode {...wasm} kind="wasm" />}
+          {focus === Focus.Gist && <Gist />}
+        </div>
+        {showStdin && (
+          <div className={styles.stdin}>
+            <Stdin />
+          </div>
+        )}
+      </>
     );
   }
 
@@ -130,7 +140,7 @@ const Output: React.FC = () => {
           onClick={focusHir}
           tabProps={hir} />
         <Tab kind={Focus.Wasm} focus={focus}
-          label="WASM"
+          label="Wasm"
           onClick={focusWasm}
           tabProps={wasm} />
         <Tab kind={Focus.Gist} focus={focus}
@@ -139,7 +149,7 @@ const Output: React.FC = () => {
           tabProps={gist} />
         {close}
       </div>
-      { body}
+      { body }
     </div>
   );
 };

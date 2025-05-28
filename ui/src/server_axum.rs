@@ -1,17 +1,17 @@
 use crate::{
     gist,
     metrics::{
-        track_metric_async, track_metric_force_endpoint_async, track_metric_no_request_async,
-        Endpoint, GenerateLabels, SuccessDetails, UNAVAILABLE_WS,
+        record_metric, track_metric_async, track_metric_no_request_async, Endpoint, GenerateLabels,
+        HasLabelsCore, Outcome, SuccessDetails, UNAVAILABLE_WS,
     },
-    sandbox::{self, Channel, Sandbox},
-    CachingSnafu, ClippyRequest, ClippyResponse, CompilationSnafu, CompileRequest, CompileResponse,
-    Config, Error, ErrorJson, EvaluateRequest, EvaluateResponse, EvaluationSnafu, ExecuteRequest,
-    ExecuteResponse, ExecutionSnafu, ExpansionSnafu, FormatRequest, FormatResponse,
-    FormattingSnafu, GhToken, GistCreationSnafu, GistLoadingSnafu, InterpretingSnafu, LintingSnafu,
+    sandbox::{self, Channel, Sandbox, DOCKER_PROCESS_TIMEOUT_SOFT},
+    CachingSnafu, ClippyRequest, ClippyResponse, ClippySnafu, CompileRequest, CompileResponse,
+    CompileSnafu, Config, Error, ErrorJson, EvaluateRequest, EvaluateResponse, EvaluateSnafu,
+    ExecuteRequest, ExecuteResponse, ExecuteSnafu, ExpansionSnafu, FormatRequest, FormatResponse,
+    FormatSnafu, GhToken, GistCreationSnafu, GistLoadingSnafu, InterpretingSnafu,
     MacroExpansionRequest, MacroExpansionResponse, MetaCratesResponse, MetaGistCreateRequest,
     MetaGistResponse, MetaVersionResponse, MetricsToken, MiriRequest, MiriResponse, Result,
-    SandboxCreationSnafu,
+    SandboxCreationSnafu, ShutdownCoordinatorSnafu, TimeoutSnafu,
 };
 use async_trait::async_trait;
 use axum::{
@@ -27,6 +27,7 @@ use axum::{
     Router,
 };
 use futures::{future::BoxFuture, FutureExt};
+use orchestrator::coordinator::{self, DockerBackend};
 use snafu::{prelude::*, IntoError};
 use std::{
     convert::{TryFrom, TryInto},
@@ -55,6 +56,8 @@ const MAX_AGE_ONE_DAY: HeaderValue = HeaderValue::from_static("public, max-age=8
 const MAX_AGE_ONE_YEAR: HeaderValue = HeaderValue::from_static("public, max-age=31536000");
 
 mod websocket;
+pub use websocket::CoordinatorManagerError as WebsocketCoordinatorManagerError;
+pub(crate) use websocket::ExecuteError as WebsocketExecuteError;
 
 #[tokio::main]
 pub(crate) async fn serve(config: Config) {
@@ -111,7 +114,8 @@ pub(crate) async fn serve(config: Config) {
         .route(&transform("/whynowebsocket"), get(whynowebsocket))
         .layer(Extension(config.clone()))
         .layer(Extension(Arc::new(SandboxCache::default())))
-        .layer(Extension(config.github_token()));
+        .layer(Extension(config.github_token()))
+        .layer(Extension(config.feature_flags));
 
     if let Some(token) = config.metrics_token() {
         app = app.layer(Extension(token))
@@ -189,54 +193,33 @@ async fn rewrite_help_as_index<B>(
 // This is a backwards compatibilty shim. The Rust documentation uses
 // this to run code in place.
 async fn evaluate(Json(req): Json<EvaluateRequest>) -> Result<Json<EvaluateResponse>> {
-    with_sandbox_force_endpoint(
-        req,
-        Endpoint::Evaluate,
-        |sb, req| async move { sb.execute(req).await }.boxed(),
-        EvaluationSnafu,
-    )
-    .await
-    .map(Json)
+    with_coordinator(req, |c, req| c.execute(req).context(EvaluateSnafu).boxed())
+        .await
+        .map(Json)
 }
 
 async fn compile(Json(req): Json<CompileRequest>) -> Result<Json<CompileResponse>> {
-    with_sandbox(
-        req,
-        |sb, req| async move { sb.compile(req).await }.boxed(),
-        CompilationSnafu,
-    )
-    .await
-    .map(Json)
+    with_coordinator(req, |c, req| c.compile(req).context(CompileSnafu).boxed())
+        .await
+        .map(Json)
 }
 
 async fn execute(Json(req): Json<ExecuteRequest>) -> Result<Json<ExecuteResponse>> {
-    with_sandbox(
-        req,
-        |sb, req| async move { sb.execute(req).await }.boxed(),
-        ExecutionSnafu,
-    )
-    .await
-    .map(Json)
+    with_coordinator(req, |c, req| c.execute(req).context(ExecuteSnafu).boxed())
+        .await
+        .map(Json)
 }
 
 async fn format(Json(req): Json<FormatRequest>) -> Result<Json<FormatResponse>> {
-    with_sandbox(
-        req,
-        |sb, req| async move { sb.format(req).await }.boxed(),
-        FormattingSnafu,
-    )
-    .await
-    .map(Json)
+    with_coordinator(req, |c, req| c.format(req).context(FormatSnafu).boxed())
+        .await
+        .map(Json)
 }
 
 async fn clippy(Json(req): Json<ClippyRequest>) -> Result<Json<ClippyResponse>> {
-    with_sandbox(
-        req,
-        |sb, req| async move { sb.clippy(req).await }.boxed(),
-        LintingSnafu,
-    )
-    .await
-    .map(Json)
+    with_coordinator(req, |c, req| c.clippy(req).context(ClippySnafu).boxed())
+        .await
+        .map(Json)
 }
 
 async fn miri(Json(req): Json<MiriRequest>) -> Result<Json<MiriResponse>> {
@@ -277,25 +260,135 @@ where
         .context(ctx)
 }
 
-async fn with_sandbox_force_endpoint<F, Req, Resp, SbReq, SbResp, Ctx>(
-    req: Req,
-    endpoint: Endpoint,
-    f: F,
-    ctx: Ctx,
-) -> Result<Resp>
+pub(crate) trait HasEndpoint {
+    const ENDPOINT: Endpoint;
+}
+
+impl HasEndpoint for EvaluateRequest {
+    const ENDPOINT: Endpoint = Endpoint::Evaluate;
+}
+
+impl HasEndpoint for CompileRequest {
+    const ENDPOINT: Endpoint = Endpoint::Compile;
+}
+
+impl HasEndpoint for ExecuteRequest {
+    const ENDPOINT: Endpoint = Endpoint::Execute;
+}
+
+impl HasEndpoint for FormatRequest {
+    const ENDPOINT: Endpoint = Endpoint::Format;
+}
+
+impl HasEndpoint for ClippyRequest {
+    const ENDPOINT: Endpoint = Endpoint::Clippy;
+}
+
+trait IsSuccess {
+    fn is_success(&self) -> bool;
+}
+
+impl<T> IsSuccess for &T
 where
-    for<'req> F: FnOnce(Sandbox, &'req SbReq) -> BoxFuture<'req, sandbox::Result<SbResp>>,
-    Resp: From<SbResp>,
-    SbReq: TryFrom<Req, Error = Error> + GenerateLabels,
-    SbResp: SuccessDetails,
-    Ctx: IntoError<Error, Source = sandbox::Error>,
+    T: IsSuccess,
 {
-    let sandbox = Sandbox::new().await.context(SandboxCreationSnafu)?;
-    let request = req.try_into()?;
-    track_metric_force_endpoint_async(request, endpoint, |request| f(sandbox, request))
+    fn is_success(&self) -> bool {
+        T::is_success(self)
+    }
+}
+
+impl<T> IsSuccess for coordinator::WithOutput<T>
+where
+    T: IsSuccess,
+{
+    fn is_success(&self) -> bool {
+        self.response.is_success()
+    }
+}
+
+impl IsSuccess for coordinator::CompileResponse {
+    fn is_success(&self) -> bool {
+        self.success
+    }
+}
+
+impl IsSuccess for coordinator::ExecuteResponse {
+    fn is_success(&self) -> bool {
+        self.success
+    }
+}
+
+impl IsSuccess for coordinator::FormatResponse {
+    fn is_success(&self) -> bool {
+        self.success
+    }
+}
+
+impl IsSuccess for coordinator::ClippyResponse {
+    fn is_success(&self) -> bool {
+        self.success
+    }
+}
+
+impl Outcome {
+    fn from_success(other: impl IsSuccess) -> Self {
+        if other.is_success() {
+            Outcome::Success
+        } else {
+            Outcome::ErrorUserCode
+        }
+    }
+}
+
+async fn with_coordinator<WebReq, WebResp, Req, Resp, F>(req: WebReq, f: F) -> Result<WebResp>
+where
+    WebReq: TryInto<Req>,
+    WebReq: HasEndpoint,
+    Error: From<WebReq::Error>,
+    Req: HasLabelsCore,
+    Resp: Into<WebResp>,
+    Resp: IsSuccess,
+    for<'f> F:
+        FnOnce(&'f coordinator::Coordinator<DockerBackend>, Req) -> BoxFuture<'f, Result<Resp>>,
+{
+    let coordinator = orchestrator::coordinator::Coordinator::new_docker().await;
+
+    let job = async {
+        let req = req.try_into()?;
+
+        let labels_core = req.labels_core();
+
+        let start = Instant::now();
+
+        let job = f(&coordinator, req);
+        let resp = tokio::time::timeout(DOCKER_PROCESS_TIMEOUT_SOFT, job).await;
+
+        let elapsed = start.elapsed();
+
+        let outcome = match &resp {
+            Ok(Ok(v)) => Outcome::from_success(v),
+            Ok(Err(_)) => Outcome::ErrorServer,
+            Err(_) => Outcome::ErrorTimeoutSoft,
+        };
+
+        // Note that any early return before this point won't be
+        // reported in the metrics!
+
+        record_metric(WebReq::ENDPOINT, labels_core, outcome, elapsed);
+
+        let resp = resp.context(TimeoutSnafu)?;
+
+        resp.map(Into::into)
+    };
+
+    let resp = job.await;
+
+    coordinator
+        .shutdown()
         .await
-        .map(Into::into)
-        .context(ctx)
+        .context(ShutdownCoordinatorSnafu)?;
+
+    resp
 }
 
 async fn meta_crates(
@@ -436,8 +529,11 @@ async fn metrics(_: MetricsAuthorization) -> Result<Vec<u8>, StatusCode> {
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-async fn websocket(ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(websocket::handle)
+async fn websocket(
+    ws: WebSocketUpgrade,
+    Extension(feature_flags): Extension<crate::FeatureFlags>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |s| websocket::handle(s, feature_flags.into()))
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -721,5 +817,476 @@ where
 {
     fn into_response(self) -> axum::response::Response {
         axum::Json(self.0).into_response()
+    }
+}
+
+pub(crate) mod api_orchestrator_integration_impls {
+    use orchestrator::coordinator::*;
+    use snafu::prelude::*;
+    use std::convert::TryFrom;
+
+    impl TryFrom<crate::EvaluateRequest> for ExecuteRequest {
+        type Error = ParseEvaluateRequestError;
+
+        fn try_from(other: crate::EvaluateRequest) -> Result<Self, Self::Error> {
+            let crate::EvaluateRequest {
+                version,
+                optimize,
+                code,
+                edition,
+                tests,
+            } = other;
+
+            let mode = if optimize != "0" {
+                Mode::Release
+            } else {
+                Mode::Debug
+            };
+
+            let edition = if edition.trim().is_empty() {
+                Edition::Rust2015
+            } else {
+                parse_edition(&edition)?
+            };
+
+            Ok(ExecuteRequest {
+                channel: parse_channel(&version)?,
+                mode,
+                edition,
+                crate_type: CrateType::Binary,
+                tests,
+                backtrace: false,
+                code,
+            })
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    pub(crate) enum ParseEvaluateRequestError {
+        #[snafu(context(false))]
+        Channel { source: ParseChannelError },
+
+        #[snafu(context(false))]
+        Edition { source: ParseEditionError },
+    }
+
+    impl From<WithOutput<ExecuteResponse>> for crate::EvaluateResponse {
+        fn from(other: WithOutput<ExecuteResponse>) -> Self {
+            let WithOutput {
+                response,
+                stdout,
+                stderr,
+            } = other;
+
+            // The old playground didn't use Cargo, so it never had the
+            // Cargo output ("Compiling playground...") which is printed
+            // to stderr. Since this endpoint is used to inline results on
+            // the page, don't include the stderr unless an error
+            // occurred.
+            if response.success {
+                crate::EvaluateResponse {
+                    result: stdout,
+                    error: None,
+                }
+            } else {
+                // When an error occurs, *some* consumers check for an
+                // `error` key, others assume that the error is crammed in
+                // the `result` field and then they string search for
+                // `error:` or `warning:`. Ew. We can put it in both.
+                let result = stderr + &stdout;
+                crate::EvaluateResponse {
+                    result: result.clone(),
+                    error: Some(result),
+                }
+            }
+        }
+    }
+
+    impl TryFrom<crate::CompileRequest> for CompileRequest {
+        type Error = ParseCompileRequestError;
+
+        fn try_from(other: crate::CompileRequest) -> Result<Self, Self::Error> {
+            let crate::CompileRequest {
+                target,
+                assembly_flavor,
+                demangle_assembly,
+                process_assembly,
+                channel,
+                mode,
+                edition,
+                crate_type,
+                tests,
+                backtrace,
+                code,
+            } = other;
+
+            Ok(Self {
+                target: parse_target(
+                    &target,
+                    assembly_flavor.as_deref(),
+                    demangle_assembly.as_deref(),
+                    process_assembly.as_deref(),
+                )?,
+                channel: parse_channel(&channel)?,
+                crate_type: parse_crate_type(&crate_type)?,
+                mode: parse_mode(&mode)?,
+                edition: parse_edition(&edition)?,
+                tests,
+                backtrace,
+                code,
+            })
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    pub(crate) enum ParseCompileRequestError {
+        #[snafu(context(false))]
+        Target { source: ParseCompileTargetError },
+
+        #[snafu(context(false))]
+        Channel { source: ParseChannelError },
+
+        #[snafu(context(false))]
+        CrateType { source: ParseCrateTypeError },
+
+        #[snafu(context(false))]
+        Mode { source: ParseModeError },
+
+        #[snafu(context(false))]
+        Edition { source: ParseEditionError },
+    }
+
+    impl From<WithOutput<CompileResponse>> for crate::CompileResponse {
+        fn from(other: WithOutput<CompileResponse>) -> Self {
+            let WithOutput {
+                response,
+                stdout,
+                stderr,
+            } = other;
+            let CompileResponse {
+                success,
+                exit_detail,
+                code,
+            } = response;
+
+            Self {
+                success,
+                exit_detail,
+                code,
+                stdout,
+                stderr,
+            }
+        }
+    }
+
+    impl TryFrom<crate::ExecuteRequest> for ExecuteRequest {
+        type Error = ParseExecuteRequestError;
+
+        fn try_from(other: crate::ExecuteRequest) -> Result<Self, Self::Error> {
+            let crate::ExecuteRequest {
+                channel,
+                mode,
+                edition,
+                crate_type,
+                tests,
+                backtrace,
+                code,
+            } = other;
+
+            Ok(Self {
+                channel: parse_channel(&channel)?,
+                crate_type: parse_crate_type(&crate_type)?,
+                mode: parse_mode(&mode)?,
+                edition: parse_edition(&edition)?,
+                tests,
+                backtrace,
+                code,
+            })
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    pub(crate) enum ParseExecuteRequestError {
+        #[snafu(context(false))]
+        Channel { source: ParseChannelError },
+
+        #[snafu(context(false))]
+        CrateType { source: ParseCrateTypeError },
+
+        #[snafu(context(false))]
+        Mode { source: ParseModeError },
+
+        #[snafu(context(false))]
+        Edition { source: ParseEditionError },
+    }
+
+    impl From<WithOutput<ExecuteResponse>> for crate::ExecuteResponse {
+        fn from(other: WithOutput<ExecuteResponse>) -> Self {
+            let WithOutput {
+                response,
+                stdout,
+                stderr,
+            } = other;
+            let ExecuteResponse {
+                success,
+                exit_detail,
+            } = response;
+
+            Self {
+                success,
+                exit_detail,
+                stdout,
+                stderr,
+            }
+        }
+    }
+
+    impl TryFrom<crate::FormatRequest> for FormatRequest {
+        type Error = ParseFormatRequestError;
+
+        fn try_from(other: crate::FormatRequest) -> std::result::Result<Self, Self::Error> {
+            let crate::FormatRequest { code, edition } = other;
+
+            Ok(FormatRequest {
+                channel: Channel::Nightly,     // TODO: use what user has submitted
+                crate_type: CrateType::Binary, // TODO: use what user has submitted
+                edition: parse_edition(&edition)?,
+                code,
+            })
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    pub(crate) enum ParseFormatRequestError {
+        #[snafu(context(false))]
+        Edition { source: ParseEditionError },
+    }
+
+    impl From<WithOutput<FormatResponse>> for crate::FormatResponse {
+        fn from(other: WithOutput<FormatResponse>) -> Self {
+            let WithOutput {
+                response,
+                stdout,
+                stderr,
+            } = other;
+            let FormatResponse {
+                success,
+                exit_detail,
+                code,
+            } = response;
+
+            Self {
+                success,
+                exit_detail,
+                code,
+                stdout,
+                stderr,
+            }
+        }
+    }
+
+    impl TryFrom<crate::ClippyRequest> for ClippyRequest {
+        type Error = ParseClippyRequestError;
+
+        fn try_from(other: crate::ClippyRequest) -> std::result::Result<Self, Self::Error> {
+            let crate::ClippyRequest {
+                code,
+                edition,
+                crate_type,
+            } = other;
+
+            Ok(ClippyRequest {
+                channel: Channel::Nightly, // TODO: use what user has submitted
+                crate_type: parse_crate_type(&crate_type)?,
+                edition: parse_edition(&edition)?,
+                code,
+            })
+        }
+    }
+
+    #[derive(Debug, Snafu)]
+    pub(crate) enum ParseClippyRequestError {
+        #[snafu(context(false))]
+        Edition { source: ParseEditionError },
+
+        #[snafu(context(false))]
+        CrateType { source: ParseCrateTypeError },
+    }
+
+    impl From<WithOutput<ClippyResponse>> for crate::ClippyResponse {
+        fn from(other: WithOutput<ClippyResponse>) -> Self {
+            let WithOutput {
+                response,
+                stdout,
+                stderr,
+            } = other;
+            let ClippyResponse {
+                success,
+                exit_detail,
+            } = response;
+
+            Self {
+                success,
+                exit_detail,
+                stdout,
+                stderr,
+            }
+        }
+    }
+
+    fn parse_target(
+        target: &str,
+        assembly_flavor: Option<&str>,
+        demangle_assembly: Option<&str>,
+        process_assembly: Option<&str>,
+    ) -> Result<CompileTarget, ParseCompileTargetError> {
+        Ok(match target {
+            "asm" => {
+                let assembly_flavor = match assembly_flavor {
+                    Some(f) => parse_assembly_flavor(f)?,
+                    None => AssemblyFlavor::Att,
+                };
+
+                let demangle = match demangle_assembly {
+                    Some(f) => parse_demangle_assembly(f)?,
+                    None => DemangleAssembly::Demangle,
+                };
+
+                let process_assembly = match process_assembly {
+                    Some(f) => parse_process_assembly(f)?,
+                    None => ProcessAssembly::Filter,
+                };
+
+                CompileTarget::Assembly(assembly_flavor, demangle, process_assembly)
+            }
+            "llvm-ir" => CompileTarget::LlvmIr,
+            "mir" => CompileTarget::Mir,
+            "hir" => CompileTarget::Hir,
+            "wasm" => CompileTarget::Wasm,
+            value => return InvalidTargetSnafu { value }.fail(),
+        })
+    }
+
+    #[derive(Debug, Snafu)]
+    pub(crate) enum ParseCompileTargetError {
+        #[snafu(context(false))]
+        AssemblyFlavor { source: ParseAssemblyFlavorError },
+
+        #[snafu(context(false))]
+        DemangleAssembly { source: ParseDemangleAssemblyError },
+
+        #[snafu(context(false))]
+        ProcessAssembly { source: ParseProcessAssemblyError },
+
+        #[snafu(display("'{value}' is not a valid target"))]
+        InvalidTarget { value: String },
+    }
+
+    fn parse_assembly_flavor(s: &str) -> Result<AssemblyFlavor, ParseAssemblyFlavorError> {
+        Ok(match s {
+            "att" => AssemblyFlavor::Att,
+            "intel" => AssemblyFlavor::Intel,
+            value => return ParseAssemblyFlavorSnafu { value }.fail(),
+        })
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("'{value}' is not a valid assembly flavor"))]
+    pub(crate) struct ParseAssemblyFlavorError {
+        value: String,
+    }
+
+    fn parse_demangle_assembly(s: &str) -> Result<DemangleAssembly, ParseDemangleAssemblyError> {
+        Ok(match s {
+            "demangle" => DemangleAssembly::Demangle,
+            "mangle" => DemangleAssembly::Mangle,
+            value => return ParseDemangleAssemblySnafu { value }.fail(),
+        })
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("'{value}' is not a valid demangle option"))]
+    pub(crate) struct ParseDemangleAssemblyError {
+        value: String,
+    }
+
+    fn parse_process_assembly(s: &str) -> Result<ProcessAssembly, ParseProcessAssemblyError> {
+        Ok(match s {
+            "filter" => ProcessAssembly::Filter,
+            "raw" => ProcessAssembly::Raw,
+            value => return ParseProcessAssemblySnafu { value }.fail(),
+        })
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("'{value}' is not a valid assembly processing option"))]
+    pub(crate) struct ParseProcessAssemblyError {
+        value: String,
+    }
+
+    pub(crate) fn parse_channel(s: &str) -> Result<Channel, ParseChannelError> {
+        Ok(match s {
+            "stable" => Channel::Stable,
+            "beta" => Channel::Beta,
+            "nightly" => Channel::Nightly,
+            value => return ParseChannelSnafu { value }.fail(),
+        })
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("'{value}' is not a valid channel"))]
+    pub(crate) struct ParseChannelError {
+        value: String,
+    }
+
+    pub(crate) fn parse_crate_type(s: &str) -> Result<CrateType, ParseCrateTypeError> {
+        use {CrateType::*, LibraryType::*};
+
+        Ok(match s {
+            "bin" => Binary,
+            "lib" => Library(Lib),
+            "dylib" => Library(Dylib),
+            "rlib" => Library(Rlib),
+            "staticlib" => Library(Staticlib),
+            "cdylib" => Library(Cdylib),
+            "proc-macro" => Library(ProcMacro),
+            value => return ParseCrateTypeSnafu { value }.fail(),
+        })
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("'{value}' is not a valid crate type"))]
+    pub(crate) struct ParseCrateTypeError {
+        value: String,
+    }
+
+    pub(crate) fn parse_mode(s: &str) -> Result<Mode, ParseModeError> {
+        Ok(match s {
+            "debug" => Mode::Debug,
+            "release" => Mode::Release,
+            value => return ParseModeSnafu { value }.fail(),
+        })
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("'{value}' is not a valid mode"))]
+    pub(crate) struct ParseModeError {
+        value: String,
+    }
+
+    pub(crate) fn parse_edition(s: &str) -> Result<Edition, ParseEditionError> {
+        Ok(match s {
+            "2015" => Edition::Rust2015,
+            "2018" => Edition::Rust2018,
+            "2021" => Edition::Rust2021,
+            "2024" => Edition::Rust2024,
+            value => return ParseEditionSnafu { value }.fail(),
+        })
+    }
+
+    #[derive(Debug, Snafu)]
+    #[snafu(display("'{value}' is not a valid edition"))]
+    pub(crate) struct ParseEditionError {
+        value: String,
     }
 }

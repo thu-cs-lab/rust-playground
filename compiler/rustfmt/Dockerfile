@@ -1,6 +1,6 @@
-ARG base_image=shepmaster/rust-nightly:sources
+ARG base_image=shepmaster/rust-nightly
 FROM ${base_image}
 
-RUN rustup component add rustfmt-preview
+# The base image takes care of all this for now
 
 ENTRYPOINT ["/playground/tools/entrypoint.sh"]

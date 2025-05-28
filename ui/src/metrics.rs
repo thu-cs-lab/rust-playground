@@ -1,11 +1,16 @@
 use futures::future::BoxFuture;
 use lazy_static::lazy_static;
+use orchestrator::coordinator;
 use prometheus::{
-    self, register_histogram, register_histogram_vec, register_int_counter, register_int_gauge,
-    Histogram, HistogramVec, IntCounter, IntGauge,
+    self, register_histogram, register_histogram_vec, register_int_counter,
+    register_int_counter_vec, register_int_gauge, Histogram, HistogramVec, IntCounter,
+    IntCounterVec, IntGauge,
 };
 use regex::Regex;
-use std::{future::Future, time::Instant};
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
 
 use crate::sandbox::{self, Channel, CompileTarget, CrateType, Edition, Mode};
 
@@ -31,6 +36,17 @@ lazy_static! {
     pub(crate) static ref UNAVAILABLE_WS: IntCounter = register_int_counter!(
         "playground_websocket_unavailability_count",
         "Number of failed WebSocket connections"
+    )
+    .unwrap();
+    pub(crate) static ref WS_INCOMING: IntCounter = register_int_counter!(
+        "playground_websocket_incoming_messages_count",
+        "Number of WebSocket messages received"
+    )
+    .unwrap();
+    pub(crate) static ref WS_OUTGOING: IntCounterVec = register_int_counter_vec!(
+        "playground_websocket_outgoing_messages_count",
+        "Number of WebSocket messages sent",
+        &["success"],
     )
     .unwrap();
 }
@@ -60,6 +76,17 @@ pub(crate) enum Outcome {
     ErrorTimeoutSoft,
     ErrorTimeoutHard,
     ErrorUserCode,
+    Abandoned,
+}
+
+pub(crate) struct LabelsCore {
+    target: Option<CompileTarget>,
+    channel: Option<Channel>,
+    mode: Option<Mode>,
+    edition: Option<Option<Edition>>,
+    crate_type: Option<CrateType>,
+    tests: Option<bool>,
+    backtrace: Option<bool>,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -132,6 +159,29 @@ impl Labels {
             backtrace,
         ]
     }
+
+    pub(crate) fn complete(endpoint: Endpoint, labels_core: LabelsCore, outcome: Outcome) -> Self {
+        let LabelsCore {
+            target,
+            channel,
+            mode,
+            edition,
+            crate_type,
+            tests,
+            backtrace,
+        } = labels_core;
+        Self {
+            endpoint,
+            outcome,
+            target,
+            channel,
+            mode,
+            edition,
+            crate_type,
+            tests,
+            backtrace,
+        }
+    }
 }
 
 pub(crate) trait GenerateLabels {
@@ -144,103 +194,6 @@ where
 {
     fn generate_labels(&self, outcome: Outcome) -> Labels {
         T::generate_labels(self, outcome)
-    }
-}
-
-impl GenerateLabels for sandbox::CompileRequest {
-    fn generate_labels(&self, outcome: Outcome) -> Labels {
-        let Self {
-            target,
-            channel,
-            crate_type,
-            mode,
-            edition,
-            tests,
-            backtrace,
-            code: _,
-        } = *self;
-
-        Labels {
-            endpoint: Endpoint::Compile,
-            outcome,
-
-            target: Some(target),
-            channel: Some(channel),
-            mode: Some(mode),
-            edition: Some(edition),
-            crate_type: Some(crate_type),
-            tests: Some(tests),
-            backtrace: Some(backtrace),
-        }
-    }
-}
-
-impl GenerateLabels for sandbox::ExecuteRequest {
-    fn generate_labels(&self, outcome: Outcome) -> Labels {
-        let Self {
-            channel,
-            mode,
-            edition,
-            crate_type,
-            tests,
-            backtrace,
-            code: _,
-        } = *self;
-
-        Labels {
-            endpoint: Endpoint::Execute,
-            outcome,
-
-            target: None,
-            channel: Some(channel),
-            mode: Some(mode),
-            edition: Some(edition),
-            crate_type: Some(crate_type),
-            tests: Some(tests),
-            backtrace: Some(backtrace),
-        }
-    }
-}
-
-impl GenerateLabels for sandbox::FormatRequest {
-    fn generate_labels(&self, outcome: Outcome) -> Labels {
-        let Self { edition, code: _ } = *self;
-
-        Labels {
-            endpoint: Endpoint::Format,
-            outcome,
-
-            target: None,
-            channel: None,
-            mode: None,
-            edition: Some(edition),
-            crate_type: None,
-            tests: None,
-            backtrace: None,
-        }
-    }
-}
-
-impl GenerateLabels for sandbox::ClippyRequest {
-    fn generate_labels(&self, outcome: Outcome) -> Labels {
-        let Self {
-            code: _,
-            edition,
-            crate_type,
-        } = *self;
-
-        Labels {
-            endpoint: Endpoint::Clippy,
-            outcome,
-
-            target: None,
-            channel: None,
-            mode: None,
-            edition: Some(edition),
-            crate_type: Some(crate_type),
-            tests: None,
-            backtrace: None,
-        }
     }
 }
 
@@ -318,30 +271,6 @@ fn common_success_details(success: bool, stderr: &str) -> Outcome {
     }
 }
 
-impl SuccessDetails for sandbox::CompileResponse {
-    fn success_details(&self) -> Outcome {
-        common_success_details(self.success, &self.stderr)
-    }
-}
-
-impl SuccessDetails for sandbox::ExecuteResponse {
-    fn success_details(&self) -> Outcome {
-        common_success_details(self.success, &self.stderr)
-    }
-}
-
-impl SuccessDetails for sandbox::FormatResponse {
-    fn success_details(&self) -> Outcome {
-        common_success_details(self.success, &self.stderr)
-    }
-}
-
-impl SuccessDetails for sandbox::ClippyResponse {
-    fn success_details(&self) -> Outcome {
-        common_success_details(self.success, &self.stderr)
-    }
-}
-
 impl SuccessDetails for sandbox::MiriResponse {
     fn success_details(&self) -> Outcome {
         common_success_details(self.success, &self.stderr)
@@ -375,19 +304,6 @@ where
     track_metric_common_async(request, body, |_| {}).await
 }
 
-pub(crate) async fn track_metric_force_endpoint_async<Req, B, Resp>(
-    request: Req,
-    endpoint: Endpoint,
-    body: B,
-) -> sandbox::Result<Resp>
-where
-    Req: GenerateLabels,
-    for<'req> B: FnOnce(&'req Req) -> BoxFuture<'req, sandbox::Result<Resp>>,
-    Resp: SuccessDetails,
-{
-    track_metric_common_async(request, body, |labels| labels.endpoint = endpoint).await
-}
-
 async fn track_metric_common_async<Req, B, Resp, F>(
     request: Req,
     body: B,
@@ -406,11 +322,8 @@ where
     let outcome = SuccessDetails::for_sandbox_result(&response);
     let mut labels = request.generate_labels(outcome);
     f(&mut labels);
-    let values = &labels.as_values();
 
-    let histogram = REQUESTS.with_label_values(values);
-
-    histogram.observe(elapsed.as_secs_f64());
+    record_metric_complete(labels, elapsed);
 
     response
 }
@@ -443,10 +356,119 @@ where
         tests: None,
         backtrace: None,
     };
-    let values = &labels.as_values();
-    let histogram = REQUESTS.with_label_values(values);
 
-    histogram.observe(elapsed.as_secs_f64());
+    record_metric_complete(labels, elapsed);
 
     response
+}
+
+pub(crate) trait HasLabelsCore {
+    fn labels_core(&self) -> LabelsCore;
+}
+
+impl HasLabelsCore for coordinator::CompileRequest {
+    fn labels_core(&self) -> LabelsCore {
+        let Self {
+            target,
+            channel,
+            crate_type,
+            mode,
+            edition,
+            tests,
+            backtrace,
+            code: _,
+        } = *self;
+
+        LabelsCore {
+            target: Some(target.into()),
+            channel: Some(channel.into()),
+            mode: Some(mode.into()),
+            edition: Some(Some(edition.into())),
+            crate_type: Some(crate_type.into()),
+            tests: Some(tests),
+            backtrace: Some(backtrace),
+        }
+    }
+}
+
+impl HasLabelsCore for coordinator::ExecuteRequest {
+    fn labels_core(&self) -> LabelsCore {
+        let Self {
+            channel,
+            crate_type,
+            mode,
+            edition,
+            tests,
+            backtrace,
+            code: _,
+        } = *self;
+
+        LabelsCore {
+            target: None,
+            channel: Some(channel.into()),
+            mode: Some(mode.into()),
+            edition: Some(Some(edition.into())),
+            crate_type: Some(crate_type.into()),
+            tests: Some(tests),
+            backtrace: Some(backtrace),
+        }
+    }
+}
+
+impl HasLabelsCore for coordinator::FormatRequest {
+    fn labels_core(&self) -> LabelsCore {
+        let Self {
+            channel,
+            crate_type,
+            edition,
+            code: _,
+        } = *self;
+
+        LabelsCore {
+            target: None,
+            channel: Some(channel.into()),
+            mode: None,
+            edition: Some(Some(edition.into())),
+            crate_type: Some(crate_type.into()),
+            tests: None,
+            backtrace: None,
+        }
+    }
+}
+
+impl HasLabelsCore for coordinator::ClippyRequest {
+    fn labels_core(&self) -> LabelsCore {
+        let Self {
+            channel,
+            crate_type,
+            edition,
+            code: _,
+        } = *self;
+
+        LabelsCore {
+            target: None,
+            channel: Some(channel.into()),
+            mode: None,
+            edition: Some(Some(edition.into())),
+            crate_type: Some(crate_type.into()),
+            tests: None,
+            backtrace: None,
+        }
+    }
+}
+
+pub(crate) fn record_metric(
+    endpoint: Endpoint,
+    labels_core: LabelsCore,
+    outcome: Outcome,
+    elapsed: Duration,
+) {
+    let labels = Labels::complete(endpoint, labels_core, outcome);
+    record_metric_complete(labels, elapsed)
+}
+
+fn record_metric_complete(labels: Labels, elapsed: Duration) {
+    let values = &labels.as_values();
+    let histogram = REQUESTS.with_label_values(values);
+    histogram.observe(elapsed.as_secs_f64());
 }

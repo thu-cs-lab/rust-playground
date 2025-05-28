@@ -1,3 +1,5 @@
+#syntax=docker/dockerfile:1.5
+
 FROM ubuntu:20.04 as toolchain
 
 ARG channel
@@ -22,7 +24,7 @@ RUN useradd -m playground -d /playground
 RUN usermod -p '!!' root # Disable all passwords for root
 
 # Attach the security note
-ADD --chown=playground attach_notice.sh security_notice.txt /playground/
+COPY --chown=playground attach_notice.sh security_notice.txt /playground/
 RUN /playground/attach_notice.sh /playground/security_notice.txt /etc/passwd && \
     /playground/attach_notice.sh /playground/security_notice.txt /etc/shadow && \
     rm -f /playground/attach_notice.sh
@@ -38,32 +40,67 @@ WORKDIR /playground
 # installation of Rust.
 ADD --chown=playground https://static.rust-lang.org/rustup/release-stable.toml /playground/tools/rustup-manifest.toml
 ADD --chown=playground https://static.rust-lang.org/dist/channel-rust-${channel}-date.txt /playground/tools/rust-channel-version
-RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --profile minimal --default-toolchain "${channel}"
+RUN curl https://sh.rustup.rs -sSf | sh -s -- \
+    -y \
+    --profile minimal \
+    --default-toolchain "${channel}" \
+    --target wasm32-unknown-unknown \
+    --component rustfmt \
+    --component clippy
 
-ADD --chown=playground entrypoint.sh /playground/tools/
+COPY --chown=playground entrypoint.sh /playground/tools/
+
+# Build wasm-tools
+
+FROM toolchain as wasm-tools
+
+RUN cargo install wasm-tools
 
 # Fetch all the crate source files
 
-FROM toolchain as bare-sources
+FROM toolchain as sources
 
 RUN cargo init /playground
 
-ADD --chown=playground Cargo.toml /playground/Cargo.toml
-ADD --chown=playground crate-information.json /playground/crate-information.json
+COPY --chown=playground Cargo.toml /playground/Cargo.toml
+COPY --chown=playground crate-information.json /playground/crate-information.json
 RUN cargo fetch
 
 # Build our tool for modifying Cargo.toml at runtime
 
-FROM bare-sources as munge
+FROM toolchain as modify-cargo-toml
 
-ADD --chown=playground modify-cargo-toml /playground/modify-cargo-toml
+COPY --chown=playground modify-cargo-toml /playground/modify-cargo-toml
 RUN cargo build --release --manifest-path=/playground/modify-cargo-toml/Cargo.toml
 
-# Compiler and sources
+# Set up cargo-chef for faster builds
 
-FROM bare-sources as sources
+FROM toolchain as chef-available
 
-COPY --from=munge /playground/modify-cargo-toml/target/release/modify-cargo-toml /playground/.cargo/bin
+RUN cargo install cargo-chef
+
+WORKDIR /orchestrator
+
+# Prepare the orchestrator's dependencies
+
+FROM chef-available as prepare-orchestrator
+
+COPY --chown=playground asm-cleanup /asm-cleanup
+COPY --chown=playground modify-cargo-toml /modify-cargo-toml
+COPY --chown=playground orchestrator /orchestrator
+RUN cargo chef prepare
+
+# Build the orchestrator
+
+FROM chef-available as build-orchestrator
+
+COPY --chown=playground asm-cleanup /asm-cleanup
+COPY --chown=playground modify-cargo-toml /modify-cargo-toml
+COPY --chown=playground --from=prepare-orchestrator /orchestrator/recipe.json /orchestrator/recipe.json
+RUN cargo chef cook --release
+
+COPY --chown=playground orchestrator /orchestrator
+RUN cargo install --path .
 
 # Compiler and pre-compiled crates
 
@@ -73,10 +110,12 @@ ARG channel
 
 RUN cargo build
 RUN cargo build --release
+RUN cargo clippy
 RUN rm src/*.rs
 
-ADD --chown=playground postinstall.sh /playground/tools/
-RUN /playground/tools/postinstall.sh ${channel}
-ADD --chown=playground cargo-wasm /playground/.cargo/bin/
+COPY --from=modify-cargo-toml /playground/modify-cargo-toml/target/release/modify-cargo-toml /playground/.cargo/bin
+COPY --from=build-orchestrator /playground/.cargo/bin/worker /playground/.cargo/bin/worker
+COPY --from=wasm-tools /playground/.cargo/bin/wasm-tools /playground/.cargo/bin
+COPY --chown=playground cargo-wasm /playground/.cargo/bin/
 
 ENTRYPOINT ["/playground/tools/entrypoint.sh"]

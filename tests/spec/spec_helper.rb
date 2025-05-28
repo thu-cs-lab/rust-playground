@@ -27,7 +27,6 @@ RSpec.configure do |config|
 end
 
 require 'capybara/rspec'
-require 'webdrivers'
 require 'capybara-screenshot/rspec'
 
 PROTOCOL = ENV.fetch('PLAYGROUND_UI_PROTOCOL', 'http')
@@ -78,6 +77,10 @@ Capybara.add_selector(:output) do
     id_s += "-#{id}" if id
     "[data-test-id = '#{id_s}']"
   end
+end
+
+Capybara.add_selector(:stdin) do
+  css { '[data-test-id = "stdin"]' }
 end
 
 RSpec.configure do |config|

@@ -10,11 +10,11 @@ use std::{
     sync::Arc,
 };
 use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 5000;
 
-mod asm_cleanup;
 mod env;
 mod gist;
 mod metrics;
@@ -27,11 +27,16 @@ fn main() {
     openssl_probe::init_ssl_cert_env_vars();
 
     // Info-level logging is enabled by default.
-    tracing_subscriber::fmt::init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
 
     let config = Config::from_env();
     server_axum::serve(config);
 }
+
+#[derive(Copy, Clone)]
+pub(crate) struct FeatureFlags {}
 
 #[derive(Clone)]
 struct Config {
@@ -39,6 +44,7 @@ struct Config {
     cors_enabled: bool,
     gh_token: Option<String>,
     metrics_token: Option<String>,
+    feature_flags: FeatureFlags,
     port: u16,
     root: PathBuf,
     public_url: String,
@@ -72,7 +78,7 @@ impl Config {
         } else {
             error!(
                 "Playground ui does not exist at {}\n\
-                Playground will not work until `yarn run build` has been run or {PLAYGROUND_UI_ROOT} has been fixed",
+                Playground will not work until `pnpm build` has been run or {PLAYGROUND_UI_ROOT} has been fixed",
                 index_html.display(),
             );
         }
@@ -94,11 +100,14 @@ impl Config {
 
         let cors_enabled = env::var_os("PLAYGROUND_CORS_ENABLED").is_some();
 
+        let feature_flags = FeatureFlags {};
+
         Self {
             address,
             cors_enabled,
             gh_token,
             metrics_token,
+            feature_flags,
             port,
             root,
             public_url,
@@ -157,21 +166,11 @@ impl MetricsToken {
 }
 
 #[derive(Debug, Snafu)]
-pub enum Error {
+enum Error {
     #[snafu(display("Sandbox creation failed: {}", source))]
     SandboxCreation { source: sandbox::Error },
-    #[snafu(display("Compilation operation failed: {}", source))]
-    Compilation { source: sandbox::Error },
-    #[snafu(display("Execution operation failed: {}", source))]
-    Execution { source: sandbox::Error },
-    #[snafu(display("Evaluation operation failed: {}", source))]
-    Evaluation { source: sandbox::Error },
-    #[snafu(display("Linting operation failed: {}", source))]
-    Linting { source: sandbox::Error },
     #[snafu(display("Expansion operation failed: {}", source))]
     Expansion { source: sandbox::Error },
-    #[snafu(display("Formatting operation failed: {}", source))]
-    Formatting { source: sandbox::Error },
     #[snafu(display("Interpreting operation failed: {}", source))]
     Interpreting { source: sandbox::Error },
     #[snafu(display("Caching operation failed: {}", source))]
@@ -186,28 +185,95 @@ pub enum Error {
     Deserialization { source: serde_json::Error },
     #[snafu(display("Unable to serialize response: {}", source))]
     Serialization { source: serde_json::Error },
-    #[snafu(display("The value {:?} is not a valid target", value))]
-    InvalidTarget { value: String },
-    #[snafu(display("The value {:?} is not a valid assembly flavor", value))]
-    InvalidAssemblyFlavor { value: String },
-    #[snafu(display("The value {:?} is not a valid demangle option", value))]
-    InvalidDemangleAssembly { value: String },
-    #[snafu(display("The value {:?} is not a valid assembly processing option", value))]
-    InvalidProcessAssembly { value: String },
-    #[snafu(display("The value {:?} is not a valid channel", value,))]
-    InvalidChannel { value: String },
-    #[snafu(display("The value {:?} is not a valid mode", value))]
-    InvalidMode { value: String },
+
+    #[snafu(context(false))]
+    EvaluateRequest {
+        source: server_axum::api_orchestrator_integration_impls::ParseEvaluateRequestError,
+    },
+
+    #[snafu(context(false))]
+    CompileRequest {
+        source: server_axum::api_orchestrator_integration_impls::ParseCompileRequestError,
+    },
+
+    #[snafu(context(false))]
+    ExecuteRequest {
+        source: server_axum::api_orchestrator_integration_impls::ParseExecuteRequestError,
+    },
+
+    #[snafu(context(false))]
+    FormatRequest {
+        source: server_axum::api_orchestrator_integration_impls::ParseFormatRequestError,
+    },
+
+    #[snafu(context(false))]
+    ClippyRequest {
+        source: server_axum::api_orchestrator_integration_impls::ParseClippyRequestError,
+    },
+
+    // Remove at a later point. From here ...
     #[snafu(display("The value {:?} is not a valid edition", value))]
     InvalidEdition { value: String },
-    #[snafu(display("The value {:?} is not a valid crate type", value))]
-    InvalidCrateType { value: String },
+    // ... to here
     #[snafu(display("No request was provided"))]
     RequestMissing,
     #[snafu(display("The cache has been poisoned"))]
     CachePoisoned,
     #[snafu(display("The WebSocket worker panicked: {}", text))]
     WebSocketTaskPanic { text: String },
+
+    #[snafu(display("Unable to shutdown the coordinator"))]
+    ShutdownCoordinator {
+        source: orchestrator::coordinator::Error,
+    },
+
+    #[snafu(display("Unable to convert the evaluate request"))]
+    Evaluate {
+        source: orchestrator::coordinator::ExecuteError,
+    },
+
+    #[snafu(display("Unable to convert the compile request"))]
+    Compile {
+        source: orchestrator::coordinator::CompileError,
+    },
+
+    #[snafu(display("Unable to convert the execute request"))]
+    Execute {
+        source: orchestrator::coordinator::ExecuteError,
+    },
+
+    #[snafu(display("Unable to convert the format request"))]
+    Format {
+        source: orchestrator::coordinator::FormatError,
+    },
+
+    #[snafu(display("Unable to convert the Clippy request"))]
+    Clippy {
+        source: orchestrator::coordinator::ClippyError,
+    },
+
+    #[snafu(display("The operation timed out"))]
+    Timeout { source: tokio::time::error::Elapsed },
+
+    #[snafu(display("Unable to spawn a coordinator task"))]
+    StreamingCoordinatorSpawn {
+        source: server_axum::WebsocketCoordinatorManagerError,
+    },
+
+    #[snafu(display("Unable to idle the coordinator"))]
+    StreamingCoordinatorIdle {
+        source: server_axum::WebsocketCoordinatorManagerError,
+    },
+
+    #[snafu(display("Unable to perform a streaming execute"))]
+    StreamingExecute {
+        source: server_axum::WebsocketExecuteError,
+    },
+
+    #[snafu(display("Unable to pass stdin to the active execution"))]
+    StreamingCoordinatorExecuteStdin {
+        source: tokio::sync::mpsc::error::SendError<()>,
+    },
 }
 
 type Result<T, E = Error> = ::std::result::Result<T, E>;
@@ -241,6 +307,8 @@ struct CompileRequest {
 #[derive(Debug, Clone, Serialize)]
 struct CompileResponse {
     success: bool,
+    #[serde(rename = "exitDetail")]
+    exit_detail: String,
     code: String,
     stdout: String,
     stderr: String,
@@ -263,6 +331,8 @@ struct ExecuteRequest {
 #[derive(Debug, Clone, Serialize)]
 struct ExecuteResponse {
     success: bool,
+    #[serde(rename = "exitDetail")]
+    exit_detail: String,
     stdout: String,
     stderr: String,
 }
@@ -277,6 +347,8 @@ struct FormatRequest {
 #[derive(Debug, Clone, Serialize)]
 struct FormatResponse {
     success: bool,
+    #[serde(rename = "exitDetail")]
+    exit_detail: String,
     code: String,
     stdout: String,
     stderr: String,
@@ -294,6 +366,7 @@ struct ClippyRequest {
 #[derive(Debug, Clone, Serialize)]
 struct ClippyResponse {
     success: bool,
+    exit_detail: String,
     stdout: String,
     stderr: String,
 }
@@ -374,130 +447,6 @@ struct EvaluateResponse {
     error: Option<String>,
 }
 
-impl TryFrom<CompileRequest> for sandbox::CompileRequest {
-    type Error = Error;
-
-    fn try_from(me: CompileRequest) -> Result<Self> {
-        let target = parse_target(&me.target)?;
-        let assembly_flavor = match me.assembly_flavor {
-            Some(f) => Some(parse_assembly_flavor(&f)?),
-            None => None,
-        };
-
-        let demangle = match me.demangle_assembly {
-            Some(f) => Some(parse_demangle_assembly(&f)?),
-            None => None,
-        };
-
-        let process_assembly = match me.process_assembly {
-            Some(f) => Some(parse_process_assembly(&f)?),
-            None => None,
-        };
-
-        let target = match (target, assembly_flavor, demangle, process_assembly) {
-            (
-                sandbox::CompileTarget::Assembly(_, _, _),
-                Some(flavor),
-                Some(demangle),
-                Some(process),
-            ) => sandbox::CompileTarget::Assembly(flavor, demangle, process),
-            _ => target,
-        };
-
-        Ok(sandbox::CompileRequest {
-            target,
-            channel: parse_channel(&me.channel)?,
-            mode: parse_mode(&me.mode)?,
-            edition: parse_edition(&me.edition)?,
-            crate_type: parse_crate_type(&me.crate_type)?,
-            tests: me.tests,
-            backtrace: me.backtrace,
-            code: me.code,
-        })
-    }
-}
-
-impl From<sandbox::CompileResponse> for CompileResponse {
-    fn from(me: sandbox::CompileResponse) -> Self {
-        CompileResponse {
-            success: me.success,
-            code: me.code,
-            stdout: me.stdout,
-            stderr: me.stderr,
-        }
-    }
-}
-
-impl TryFrom<ExecuteRequest> for sandbox::ExecuteRequest {
-    type Error = Error;
-
-    fn try_from(me: ExecuteRequest) -> Result<Self> {
-        Ok(sandbox::ExecuteRequest {
-            channel: parse_channel(&me.channel)?,
-            mode: parse_mode(&me.mode)?,
-            edition: parse_edition(&me.edition)?,
-            crate_type: parse_crate_type(&me.crate_type)?,
-            tests: me.tests,
-            backtrace: me.backtrace,
-            code: me.code,
-        })
-    }
-}
-
-impl From<sandbox::ExecuteResponse> for ExecuteResponse {
-    fn from(me: sandbox::ExecuteResponse) -> Self {
-        ExecuteResponse {
-            success: me.success,
-            stdout: me.stdout,
-            stderr: me.stderr,
-        }
-    }
-}
-
-impl TryFrom<FormatRequest> for sandbox::FormatRequest {
-    type Error = Error;
-
-    fn try_from(me: FormatRequest) -> Result<Self> {
-        Ok(sandbox::FormatRequest {
-            code: me.code,
-            edition: parse_edition(&me.edition)?,
-        })
-    }
-}
-
-impl From<sandbox::FormatResponse> for FormatResponse {
-    fn from(me: sandbox::FormatResponse) -> Self {
-        FormatResponse {
-            success: me.success,
-            code: me.code,
-            stdout: me.stdout,
-            stderr: me.stderr,
-        }
-    }
-}
-
-impl TryFrom<ClippyRequest> for sandbox::ClippyRequest {
-    type Error = Error;
-
-    fn try_from(me: ClippyRequest) -> Result<Self> {
-        Ok(sandbox::ClippyRequest {
-            code: me.code,
-            crate_type: parse_crate_type(&me.crate_type)?,
-            edition: parse_edition(&me.edition)?,
-        })
-    }
-}
-
-impl From<sandbox::ClippyResponse> for ClippyResponse {
-    fn from(me: sandbox::ClippyResponse) -> Self {
-        ClippyResponse {
-            success: me.success,
-            stdout: me.stdout,
-            stderr: me.stderr,
-        }
-    }
-}
-
 impl TryFrom<MiriRequest> for sandbox::MiriRequest {
     type Error = Error;
 
@@ -575,129 +524,14 @@ impl From<gist::Gist> for MetaGistResponse {
     }
 }
 
-impl TryFrom<EvaluateRequest> for sandbox::ExecuteRequest {
-    type Error = Error;
-
-    fn try_from(me: EvaluateRequest) -> Result<Self> {
-        Ok(sandbox::ExecuteRequest {
-            channel: parse_channel(&me.version)?,
-            mode: if me.optimize != "0" {
-                sandbox::Mode::Release
-            } else {
-                sandbox::Mode::Debug
-            },
-            edition: parse_edition(&me.edition)?,
-            crate_type: sandbox::CrateType::Binary,
-            tests: me.tests,
-            backtrace: false,
-            code: me.code,
-        })
-    }
-}
-
-impl From<sandbox::ExecuteResponse> for EvaluateResponse {
-    fn from(me: sandbox::ExecuteResponse) -> Self {
-        // The old playground didn't use Cargo, so it never had the
-        // Cargo output ("Compiling playground...") which is printed
-        // to stderr. Since this endpoint is used to inline results on
-        // the page, don't include the stderr unless an error
-        // occurred.
-        if me.success {
-            EvaluateResponse {
-                result: me.stdout,
-                error: None,
-            }
-        } else {
-            // When an error occurs, *some* consumers check for an
-            // `error` key, others assume that the error is crammed in
-            // the `result` field and then they string search for
-            // `error:` or `warning:`. Ew. We can put it in both.
-            let result = me.stderr + &me.stdout;
-            EvaluateResponse {
-                result: result.clone(),
-                error: Some(result),
-            }
-        }
-    }
-}
-
-fn parse_target(s: &str) -> Result<sandbox::CompileTarget> {
-    Ok(match s {
-        "asm" => sandbox::CompileTarget::Assembly(
-            sandbox::AssemblyFlavor::Att,
-            sandbox::DemangleAssembly::Demangle,
-            sandbox::ProcessAssembly::Filter,
-        ),
-        "llvm-ir" => sandbox::CompileTarget::LlvmIr,
-        "mir" => sandbox::CompileTarget::Mir,
-        "hir" => sandbox::CompileTarget::Hir,
-        "wasm" => sandbox::CompileTarget::Wasm,
-        value => InvalidTargetSnafu { value }.fail()?,
-    })
-}
-
-fn parse_assembly_flavor(s: &str) -> Result<sandbox::AssemblyFlavor> {
-    Ok(match s {
-        "att" => sandbox::AssemblyFlavor::Att,
-        "intel" => sandbox::AssemblyFlavor::Intel,
-        value => InvalidAssemblyFlavorSnafu { value }.fail()?,
-    })
-}
-
-fn parse_demangle_assembly(s: &str) -> Result<sandbox::DemangleAssembly> {
-    Ok(match s {
-        "demangle" => sandbox::DemangleAssembly::Demangle,
-        "mangle" => sandbox::DemangleAssembly::Mangle,
-        value => InvalidDemangleAssemblySnafu { value }.fail()?,
-    })
-}
-
-fn parse_process_assembly(s: &str) -> Result<sandbox::ProcessAssembly> {
-    Ok(match s {
-        "filter" => sandbox::ProcessAssembly::Filter,
-        "raw" => sandbox::ProcessAssembly::Raw,
-        value => InvalidProcessAssemblySnafu { value }.fail()?,
-    })
-}
-
-fn parse_channel(s: &str) -> Result<sandbox::Channel> {
-    Ok(match s {
-        "stable" => sandbox::Channel::Stable,
-        "beta" => sandbox::Channel::Beta,
-        "nightly" => sandbox::Channel::Nightly,
-        value => InvalidChannelSnafu { value }.fail()?,
-    })
-}
-
-fn parse_mode(s: &str) -> Result<sandbox::Mode> {
-    Ok(match s {
-        "debug" => sandbox::Mode::Debug,
-        "release" => sandbox::Mode::Release,
-        value => InvalidModeSnafu { value }.fail()?,
-    })
-}
-
 fn parse_edition(s: &str) -> Result<Option<sandbox::Edition>> {
     Ok(match s {
         "" => None,
         "2015" => Some(sandbox::Edition::Rust2015),
         "2018" => Some(sandbox::Edition::Rust2018),
         "2021" => Some(sandbox::Edition::Rust2021),
+        "2024" => Some(sandbox::Edition::Rust2024),
         value => InvalidEditionSnafu { value }.fail()?,
-    })
-}
-
-fn parse_crate_type(s: &str) -> Result<sandbox::CrateType> {
-    use crate::sandbox::{CrateType::*, LibraryType::*};
-    Ok(match s {
-        "bin" => Binary,
-        "lib" => Library(Lib),
-        "dylib" => Library(Dylib),
-        "rlib" => Library(Rlib),
-        "staticlib" => Library(Staticlib),
-        "cdylib" => Library(Cdylib),
-        "proc-macro" => Library(ProcMacro),
-        value => InvalidCrateTypeSnafu { value }.fail()?,
     })
 }
 
